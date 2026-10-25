@@ -1,0 +1,1581 @@
+diff --git a/engines/neverhood/detection.cpp b/engines/neverhood/detection.cpp
+index dd5fa9d4..e4910609 100644
+--- a/engines/neverhood/detection.cpp
++++ b/engines/neverhood/detection.cpp
+@@ -141,9 +141,17 @@ static const ADGameDescription gameDescriptions[] = {
+ } // End of namespace Neverhood
+ 
+ 
++static const char *const neverhoodDirectoryGlobs[] = {
++	"data",
++	nullptr
++};
++
+ class NeverhoodMetaEngineDetection : public AdvancedMetaEngineDetection<ADGameDescription> {
+ public:
+ 	NeverhoodMetaEngineDetection() : AdvancedMetaEngineDetection(Neverhood::gameDescriptions, neverhoodGames) {
++		// Claybox: allow pointing straight at the disc / mounted ISO, where the files live in DATA
++		_maxScanDepth = 2;
++		_directoryGlobs = neverhoodDirectoryGlobs;
+ 		_guiOptions = GUIO5(GUIO_NOMIDI, GAMEOPTION_ORIGINAL_SAVELOAD, GAMEOPTION_SKIP_HALL_OF_RECORDS,
+ 				    GAMEOPTION_SCALE_MAKING_OF_VIDEOS, GAMEOPTION_REPEAT_WILLIE_HINT);
+ 	}
+diff --git a/engines/neverhood/graphics.cpp b/engines/neverhood/graphics.cpp
+index cdf91b8d..31d14246 100644
+--- a/engines/neverhood/graphics.cpp
++++ b/engines/neverhood/graphics.cpp
+@@ -46,10 +46,22 @@ BaseSurface::BaseSurface(NeverhoodEngine *vm, int priority, int16 width, int16 h
+ }
+ 
+ BaseSurface::~BaseSurface() {
++	hdUnbind();
+ 	_surface->free();
+ 	delete _surface;
+ }
+ 
++// Claybox HD: only opaque backgrounds drawn straight from one bitmap get an HD image.
++void BaseSurface::hdBind(uint32 fileHash) {
++	if (_vm->_screen && _vm->_screen->getHDLayer())
++		_vm->_screen->getHDLayer()->bindSurface(_surface, fileHash);
++}
++
++void BaseSurface::hdUnbind() {
++	if (_vm->_screen && _vm->_screen->getHDLayer())
++		_vm->_screen->getHDLayer()->unbindSurface(_surface);
++}
++
+ void BaseSurface::draw() {
+ 	if (_surface && _visible && _drawRect.width > 0 && _drawRect.height > 0) {
+ 		if (_clipRects && _clipRectsCount) {
+@@ -63,6 +75,7 @@ void BaseSurface::draw() {
+ }
+ 
+ void BaseSurface::clear() {
++	hdUnbind();
+ 	_surface->fillRect(Common::Rect(0, 0, _surface->w, _surface->h), 0);
+ 	++_version;
+ }
+@@ -73,6 +86,10 @@ void BaseSurface::drawSpriteResource(SpriteResource &spriteResource) {
+ 		clear();
+ 		spriteResource.draw(_surface, false, false);
+ 		++_version;
++		if (!_transparent)
++			hdBind(spriteResource.getFileHash());
++		else if (_vm->_screen && _vm->_screen->getHDLayer())
++			_vm->_screen->getHDLayer()->bindSprite(_surface, spriteResource.getFileHash(), 0, false, false);
+ 	}
+ }
+ 
+@@ -87,6 +104,9 @@ void BaseSurface::drawSpriteResourceEx(SpriteResource &spriteResource, bool flip
+ 			clear();
+ 			spriteResource.draw(_surface, flipX, flipY);
+ 			++_version;
++			// Claybox HD: static objects use the sprite pipeline too (frame 0)
++			if (_transparent && _vm->_screen && _vm->_screen->getHDLayer())
++				_vm->_screen->getHDLayer()->bindSprite(_surface, spriteResource.getFileHash(), 0, flipX, flipY);
+ 		}
+ 	}
+ }
+@@ -101,12 +121,15 @@ void BaseSurface::drawAnimResource(AnimResource &animResource, uint frameIndex,
+ 		if (frameIndex < animResource.getFrameCount()) {
+ 			animResource.draw(frameIndex, _surface, flipX, flipY);
+ 			++_version;
++			if (!animResource.isReplacingColors() && _vm->_screen && _vm->_screen->getHDLayer())
++				_vm->_screen->getHDLayer()->bindSprite(_surface, animResource.getFileHash(), frameIndex, flipX, flipY);
+ 		}
+ 	}
+ }
+ 
+ void BaseSurface::drawMouseCursorResource(MouseCursorResource &mouseCursorResource, int frameNum) {
+ 	if (frameNum < 3) {
++		hdUnbind();
+ 		mouseCursorResource.draw(frameNum, _surface);
+ 		++_version;
+ 	}
+@@ -122,6 +145,7 @@ void BaseSurface::copyFrom(Graphics::Surface *sourceSurface, int16 x, int16 y, N
+ 	if (y + sourceRect.height > _surface->h)
+ 		sourceRect.height = _surface->h - y - 1;
+ 
++	hdUnbind();
+ 	byte *source = (byte*)sourceSurface->getBasePtr(sourceRect.x, sourceRect.y);
+ 	byte *dest = (byte*)_surface->getBasePtr(x, y);
+ 	int height = sourceRect.height;
+diff --git a/engines/neverhood/graphics.h b/engines/neverhood/graphics.h
+index 759ae929..f4dcc2ce 100644
+--- a/engines/neverhood/graphics.h
++++ b/engines/neverhood/graphics.h
+@@ -120,6 +120,8 @@ protected:
+ 	bool _transparent;
+ 	// Version changes each time the pixels are touched in any way
+ 	byte _version;
++	void hdBind(uint32 fileHash);
++	void hdUnbind();
+ };
+ 
+ class ShadowSurface : public BaseSurface {
+diff --git a/engines/neverhood/hdlayer.cpp b/engines/neverhood/hdlayer.cpp
+new file mode 100644
+index 00000000..634d70a5
+--- /dev/null
++++ b/engines/neverhood/hdlayer.cpp
+@@ -0,0 +1,318 @@
++/* ScummVM - Graphic Adventure Engine
++ *
++ * ScummVM is the legal property of its developers, whose names
++ * are too numerous to list here. Please refer to the COPYRIGHT
++ * file distributed with this source distribution.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include "common/file.h"
++#include "common/system.h"
++#include "common/str.h"
++#include "common/textconsole.h"
++#include "image/png.h"
++#include "image/jpeg.h"
++
++#include "neverhood/hdlayer.h"
++#include "neverhood/neverhood.h"
++#include "neverhood/resource.h"
++
++namespace Neverhood {
++
++HDLayer::HDLayer(NeverhoodEngine *vm, const Common::FSNode &dir, const Graphics::PixelFormat &format)
++	: _vm(vm), _dir(dir), _format(format), _useCounter(0) {
++	for (int i = 0; i < kAllSlots; i++)
++		_images[i] = nullptr;
++	_spriteDirChecked = _spriteDirOk = false;
++	for (int i = 0; i < kVideoSlots; i++)
++		_videoSlotHash[i] = 0;
++}
++
++HDLayer::~HDLayer() {
++	for (int i = 0; i < kAllSlots; i++)
++		freeImage(i);
++}
++
++bool HDLayer::folderHasImages(const Common::FSNode &dir) {
++	if (!dir.exists() || !dir.isDirectory())
++		return false;
++	Common::FSList files;
++	if (!dir.getChildren(files, Common::FSNode::kListFilesOnly))
++		return false;
++	for (Common::FSList::const_iterator it = files.begin(); it != files.end(); ++it)
++		if (it->getFileName().hasSuffixIgnoreCase(".png"))
++			return true;
++	return false;
++}
++
++void HDLayer::freeImage(int index) {
++	if (_images[index]) {
++		_images[index]->surface.free();
++		delete _images[index];
++		_images[index] = nullptr;
++	}
++}
++
++HDImage *HDLayer::loadImage(uint32 fileHash, const Graphics::Surface *surface) {
++	const Common::String name = Common::String::format("%08X.png", fileHash);
++	Common::FSNode node = _dir.getChild(name);
++	if (!node.exists())
++		return nullptr;
++
++	Common::File file;
++	if (!file.open(node))
++		return nullptr;
++
++	Image::PNGDecoder decoder;
++	if (!decoder.loadStream(file)) {
++		warning("Claybox HD: could not decode %s", name.c_str());
++		return nullptr;
++	}
++
++	const Graphics::Surface *png = decoder.getSurface();
++	// The HD image is kScale x the original sprite. The background surface may be
++	// a few pixels wider than the sprite (its pitch is aligned to 4 bytes).
++	if (png->w > surface->w * kScale || png->h > surface->h * kScale ||
++		png->w < (surface->w - 4) * kScale || png->h < surface->h * kScale) {
++		warning("Claybox HD: %s has size %dx%d, expected about %dx%d - ignored",
++			name.c_str(), png->w, png->h, surface->w * kScale, surface->h * kScale);
++		return nullptr;
++	}
++
++	HDImage *image = new HDImage();
++	image->fileHash = fileHash;
++	image->boundCount = 0;
++	image->lastUse = 0;
++	image->video = false;
++	image->sprite = false;
++	image->frame = 0;
++	image->flipX = image->flipY = false;
++	Graphics::Surface *converted = png->convertTo(_format, decoder.getPalette().data(), decoder.getPalette().size());
++	image->surface.copyFrom(*converted);
++	converted->free();
++	delete converted;
++
++	// The palette the original bitmap was drawn with, used to follow palette fades.
++	PaletteResource paletteResource(_vm);
++	if (paletteResource.load(fileHash))
++		paletteResource.copyPalette(image->basePalette);
++	else
++		memset(image->basePalette, 0, sizeof(image->basePalette));
++
++	g_system->logMessage(LogMessageType::kInfo, Common::String::format("Claybox HD: showing HD background %s\n", name.c_str()).c_str());
++	return image;
++}
++
++byte HDLayer::acquireImage(uint32 fileHash, const Graphics::Surface *surface) {
++	// Already cached?
++	for (int i = 0; i < kMaxImages; i++)
++		if (_images[i] && _images[i]->fileHash == fileHash)
++			return i + 1;
++
++	HDImage *image = loadImage(fileHash, surface);
++	if (!image)
++		return 0;
++
++	// Find a free slot, or evict the least recently used unbound image.
++	int slot = -1;
++	for (int i = 0; i < kMaxImages && slot < 0; i++)
++		if (!_images[i])
++			slot = i;
++	if (slot < 0) {
++		uint32 oldest = 0xFFFFFFFF;
++		for (int i = 0; i < kMaxImages; i++)
++			if (_images[i]->boundCount == 0 && _images[i]->lastUse < oldest) {
++				oldest = _images[i]->lastUse;
++				slot = i;
++			}
++	}
++	if (slot < 0) {
++		image->surface.free();
++		delete image;
++		return 0;
++	}
++	freeImage(slot);
++	_images[slot] = image;
++	return slot + 1;
++}
++
++void HDLayer::bindSurface(const Graphics::Surface *surface, uint32 fileHash) {
++	unbindSurface(surface);
++	if (!fileHash)
++		return;
++	byte id = acquireImage(fileHash, surface);
++	if (!id)
++		return;
++	HDImage *image = _images[id - 1];
++	image->boundCount++;
++	image->lastUse = ++_useCounter;
++	Binding binding;
++	binding.surface = surface;
++	binding.imageId = id;
++	_bindings.push_back(binding);
++}
++
++void HDLayer::unbindSurface(const Graphics::Surface *surface) {
++	for (uint i = 0; i < _bindings.size(); i++) {
++		if (_bindings[i].surface == surface) {
++			HDImage *image = getImage(_bindings[i].imageId);
++			if (image && image->boundCount > 0)
++				image->boundCount--;
++			_bindings.remove_at(i);
++			return;
++		}
++	}
++}
++
++void HDLayer::bindVideoFrame(const Graphics::Surface *surface, uint32 fileHash, uint32 frame) {
++	unbindSurface(surface);
++	if (!_videoDir.exists())
++		return;
++	Common::FSNode dir = _videoDir.getChild(Common::String::format("%08X", fileHash));
++	if (!dir.isDirectory())
++		return;
++	Common::FSNode node = dir.getChild(Common::String::format("%05u.jpg", frame));
++	Common::File file;
++	if (!node.exists() || !file.open(node))
++		return;
++	Image::JPEGDecoder decoder;
++	if (!decoder.loadStream(file))
++		return;
++	const Graphics::Surface *jpg = decoder.getSurface();
++	if (!jpg || jpg->w < surface->w * 2 - 8 || jpg->w > surface->w * 2 + 8 || jpg->h != surface->h * 2)
++		return;
++
++	// reuse the slot already showing this video, else the other one
++	int slot = 0;
++	for (int i = 0; i < kVideoSlots; i++)
++		if (_videoSlotHash[i] == fileHash)
++			slot = i;
++	if (_videoSlotHash[slot] != fileHash)
++		for (int i = 0; i < kVideoSlots; i++)
++			if (_videoSlotHash[i] == 0 || !_images[kMaxImages + i] || _images[kMaxImages + i]->boundCount == 0) {
++				slot = i;
++				break;
++			}
++	const int index = kMaxImages + slot;
++	HDImage *image = _images[index];
++	if (!image) {
++		image = new HDImage();
++		_images[index] = image;
++	}
++	image->surface.free();
++	Graphics::Surface *converted = jpg->convertTo(_format);
++	image->surface.copyFrom(*converted);
++	converted->free();
++	delete converted;
++	image->fileHash = fileHash;
++	image->video = true;
++	image->sprite = false;
++	image->boundCount = 1;
++	image->lastUse = ++_useCounter;
++	memset(image->basePalette, 0, sizeof(image->basePalette));
++	_videoSlotHash[slot] = fileHash;
++
++	Binding binding;
++	binding.surface = surface;
++	binding.imageId = index + 1;
++	_bindings.push_back(binding);
++}
++
++void HDLayer::bindSprite(const Graphics::Surface *surface, uint32 animHash, uint32 frame, bool flipX, bool flipY) {
++	unbindSurface(surface);
++	if (!_spriteDirChecked) {
++		_spriteDirChecked = true;
++		_spriteDirOk = _spriteDir.exists() && _spriteDir.isDirectory();
++	}
++	if (!_spriteDirOk || !animHash)
++		return;
++
++	// cached?
++	int slot = -1;
++	for (int i = kMaxImages + kVideoSlots; i < kAllSlots && slot < 0; i++) {
++		const HDImage *im = _images[i];
++		if (im && im->sprite && im->fileHash == animHash && im->frame == frame && im->flipX == flipX && im->flipY == flipY)
++			slot = i;
++	}
++
++	if (slot < 0) {
++		Common::FSNode dir = _spriteDir.getChild(Common::String::format("%08X", animHash));
++		Common::FSNode node = dir.getChild(Common::String::format("%04u.png", frame));
++		Common::File file;
++		if (!node.exists() || !file.open(node))
++			return;
++		Image::PNGDecoder decoder;
++		if (!decoder.loadStream(file))
++			return;
++		Graphics::Surface *conv = decoder.getSurface()->convertTo(spriteFormat(), decoder.getPalette().data(), decoder.getPalette().size());
++		if (!conv)
++			return;
++		// pick a free slot, else the least recently used unbound one
++		uint32 oldest = 0xFFFFFFFF;
++		for (int i = kMaxImages + kVideoSlots; i < kAllSlots; i++) {
++			if (!_images[i]) { slot = i; break; }
++			if (_images[i]->boundCount == 0 && _images[i]->lastUse < oldest) {
++				oldest = _images[i]->lastUse;
++				slot = i;
++			}
++		}
++		if (slot < 0) {
++			conv->free();
++			delete conv;
++			return;
++		}
++		freeImage(slot);
++		HDImage *image = new HDImage();
++		image->surface.create(conv->w, conv->h, spriteFormat());
++		for (int y = 0; y < conv->h; y++)
++			for (int x = 0; x < conv->w; x++) {
++				const int sx = flipX ? conv->w - 1 - x : x;
++				const int sy = flipY ? conv->h - 1 - y : y;
++				*(uint32*)image->surface.getBasePtr(x, y) = *(const uint32*)conv->getBasePtr(sx, sy);
++			}
++		conv->free();
++		delete conv;
++		image->fileHash = animHash;
++		image->frame = frame;
++		image->flipX = flipX;
++		image->flipY = flipY;
++		image->video = false;
++		image->sprite = true;
++		image->boundCount = 0;
++		memset(image->basePalette, 0, sizeof(image->basePalette));
++		Common::File palFile;
++		if (palFile.open(dir.getChild("palette.bin")))
++			palFile.read(image->basePalette, 1024);
++		_images[slot] = image;
++	}
++
++	HDImage *image = _images[slot];
++	image->boundCount++;
++	image->lastUse = ++_useCounter;
++	Binding binding;
++	binding.surface = surface;
++	binding.imageId = slot + 1;
++	_bindings.push_back(binding);
++}
++
++byte HDLayer::findImageId(const Graphics::Surface *surface) const {
++	for (uint i = 0; i < _bindings.size(); i++)
++		if (_bindings[i].surface == surface)
++			return _bindings[i].imageId;
++	return 0;
++}
++
++} // End of namespace Neverhood
+diff --git a/engines/neverhood/hdlayer.h b/engines/neverhood/hdlayer.h
+new file mode 100644
+index 00000000..47a168dc
+--- /dev/null
++++ b/engines/neverhood/hdlayer.h
+@@ -0,0 +1,112 @@
++/* ScummVM - Graphic Adventure Engine
++ *
++ * ScummVM is the legal property of its developers, whose names
++ * are too numerous to list here. Please refer to the COPYRIGHT
++ * file distributed with this source distribution.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++// Claybox HD layer: optional 2x replacement images for backgrounds.
++//
++// The game logic keeps running at 640x480 with 8-bit indexed pixels.
++// HD images are looked up by resource hash in a user-generated folder
++// (made on the user's own machine from their own game disc; nothing is
++// shipped with the app). Everything without an HD image is scaled up
++// from the original pixels.
++
++#ifndef NEVERHOOD_HDLAYER_H
++#define NEVERHOOD_HDLAYER_H
++
++#include "common/array.h"
++#include "common/fs.h"
++#include "graphics/pixelformat.h"
++#include "graphics/surface.h"
++
++namespace Neverhood {
++
++class NeverhoodEngine;
++
++struct HDImage {
++	uint32 fileHash;
++	Graphics::Surface surface;  // kScale x the original, in the screen format
++	byte basePalette[1024];     // the palette the image was made with (RGBX)
++	uint32 lastUse;
++	int boundCount;
++	bool video;              // a video frame: colors are final, no palette following
++	bool sprite;             // an animation frame: RGBA (alpha = soft edges), stored as RGBA32
++	uint32 frame;            // sprite frame index
++	bool flipX, flipY;       // sprite stored mirrored
++};
++
++class HDLayer {
++public:
++	static const int kScale = 2;
++	static const int kMaxImages = 16;      // background slots: ids 1..16
++	static const int kVideoSlots = 2;      // video frame slots: ids 17..18
++	static const int kSpriteSlots = 100;   // animation frame slots: ids 19..118
++	static const int kAllSlots = kMaxImages + kVideoSlots + kSpriteSlots;
++	static const byte kDoubledFlag = 0x80; // owner flag: pixel belongs to a 2x-doubled video
++
++	HDLayer(NeverhoodEngine *vm, const Common::FSNode &dir, const Graphics::PixelFormat &format);
++	~HDLayer();
++
++	// Called whenever a background surface gets new pixels.
++	void bindSurface(const Graphics::Surface *surface, uint32 fileHash);
++	void unbindSurface(const Graphics::Surface *surface);
++
++	// Returns an image id (1..kMaxImages) bound to the surface, or 0.
++	byte findImageId(const Graphics::Surface *surface) const;
++	HDImage *getImage(byte id) const { return (id > 0 && id <= kAllSlots) ? _images[id - 1] : nullptr; }
++
++	// HD animation frames: <sprite folder>/<ANIM>/<FFFF>.png (RGBA, 2x) + palette.bin
++	void setSpriteDir(const Common::FSNode &dir) { _spriteDir = dir; }
++	void bindSprite(const Graphics::Surface *surface, uint32 animHash, uint32 frame, bool flipX, bool flipY);
++	static Graphics::PixelFormat spriteFormat() { return Graphics::PixelFormat::createFormatRGBA32(); }
++
++	// HD video frames: <video folder>/<HASH>/<NNNNN>.jpg, 2x the video's own size.
++	void setVideoDir(const Common::FSNode &dir) { _videoDir = dir; }
++	void bindVideoFrame(const Graphics::Surface *surface, uint32 fileHash, uint32 frame);
++
++	const Graphics::PixelFormat &getFormat() const { return _format; }
++
++	// True if the folder contains at least one HD image.
++	static bool folderHasImages(const Common::FSNode &dir);
++
++private:
++	struct Binding {
++		const Graphics::Surface *surface;
++		byte imageId;
++	};
++
++	byte acquireImage(uint32 fileHash, const Graphics::Surface *surface);
++	HDImage *loadImage(uint32 fileHash, const Graphics::Surface *surface);
++	void freeImage(int index);
++
++	NeverhoodEngine *_vm;
++	Common::FSNode _dir;
++	Graphics::PixelFormat _format;
++	HDImage *_images[kAllSlots];
++	Common::FSNode _spriteDir;
++	bool _spriteDirChecked, _spriteDirOk;
++	Common::FSNode _videoDir;
++	uint32 _videoSlotHash[kVideoSlots];
++	Common::Array<Binding> _bindings;
++	uint32 _useCounter;
++};
++
++} // End of namespace Neverhood
++
++#endif /* NEVERHOOD_HDLAYER_H */
+diff --git a/engines/neverhood/module.mk b/engines/neverhood/module.mk
+index 6f27485e..1c64b8ef 100644
+--- a/engines/neverhood/module.mk
++++ b/engines/neverhood/module.mk
+@@ -10,6 +10,7 @@ MODULE_OBJS = \
+ 	gamemodule.o \
+ 	gamevars.o \
+ 	graphics.o \
++	hdlayer.o \
+ 	klaymen.o \
+ 	menumodule.o \
+ 	metaengine.o \
+diff --git a/engines/neverhood/mouse.cpp b/engines/neverhood/mouse.cpp
+index 1d867839..8a173d18 100644
+--- a/engines/neverhood/mouse.cpp
++++ b/engines/neverhood/mouse.cpp
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "neverhood/mouse.h"
++#include "neverhood/screen.h"
+ #include "graphics/cursorman.h"
+ 
+ namespace Neverhood {
+@@ -184,7 +185,54 @@ void Mouse::updateCursor() {
+ 		_drawOffset = _mouseCursorResource.getRect();
+ 		_surface->drawMouseCursorResource(_mouseCursorResource, _frameNum / 2);
+ 		Graphics::Surface *cursorSurface = _surface->getSurface();
+-		CursorMan.replaceCursor(*cursorSurface, -_drawOffset.x, -_drawOffset.y, 0);
++		if (_vm->_screen->isHD() && _vm->_screen->getPaletteData()) {
++			// Claybox HD: a smooth 2x cursor with soft (anti-aliased) edges
++			const int s = _vm->_screen->getScale();
++			const Graphics::PixelFormat format = Graphics::PixelFormat::createFormatRGBA32();
++			const byte *palette = _vm->_screen->getPaletteData();
++			const int sw = cursorSurface->w, sh = cursorSurface->h;
++			auto px = [&](int x, int y, float &r, float &g, float &b) -> float {
++				x = CLIP(x, 0, sw - 1);
++				y = CLIP(y, 0, sh - 1);
++				const byte index = *(const byte*)cursorSurface->getBasePtr(x, y);
++				if (!index)
++					return 0.0f;
++				r = palette[index * 4]; g = palette[index * 4 + 1]; b = palette[index * 4 + 2];
++				return 1.0f;
++			};
++			Graphics::Surface hdCursor;
++			hdCursor.create(sw * s, sh * s, format);
++			for (int y = 0; y < hdCursor.h; y++) {
++				const float fy = (y + 0.5f) / s - 0.5f;
++				const int y0 = (int)floorf(fy);
++				const float ty = fy - y0;
++				for (int x = 0; x < hdCursor.w; x++) {
++					const float fx = (x + 0.5f) / s - 0.5f;
++					const int x0 = (int)floorf(fx);
++					const float tx = fx - x0;
++					float a = 0, r = 0, g = 0, b = 0;
++					for (int k = 0; k < 4; k++) {
++						const int dx = k & 1, dy = k >> 1;
++						const float w = (dx ? tx : 1 - tx) * (dy ? ty : 1 - ty);
++						float cr = 0, cg = 0, cb = 0;
++						const float ca = px(x0 + dx, y0 + dy, cr, cg, cb) * w;
++						a += ca; r += cr * ca; g += cg * ca; b += cb * ca;
++					}
++					uint32 color = 0;
++					if (a > 0.001f) {
++						r /= a; g /= a; b /= a;
++						// keep edges crisp but smooth: steepen the alpha ramp
++						float alpha = CLIP((a - 0.5f) * 1.8f + 0.5f, 0.0f, 1.0f);
++						color = format.ARGBToColor((byte)(alpha * 255), (byte)r, (byte)g, (byte)b);
++					}
++					*(uint32*)hdCursor.getBasePtr(x, y) = color;
++				}
++			}
++			CursorMan.replaceCursor(hdCursor, -_drawOffset.x * s, -_drawOffset.y * s, 0);
++			hdCursor.free();
++		} else {
++			CursorMan.replaceCursor(*cursorSurface, -_drawOffset.x, -_drawOffset.y, 0);
++		}
+ 	}
+ 
+ }
+diff --git a/engines/neverhood/neverhood.cpp b/engines/neverhood/neverhood.cpp
+index 787e50e3..c88293bb 100644
+--- a/engines/neverhood/neverhood.cpp
++++ b/engines/neverhood/neverhood.cpp
+@@ -32,12 +32,16 @@
+ 
+ #include "engines/util.h"
+ 
++#include "image/png.h"
++#include "video/smk_decoder.h"
++
+ #include "neverhood/neverhood.h"
+ #include "neverhood/blbarchive.h"
+ #include "neverhood/console.h"
+ #include "neverhood/gamemodule.h"
+ #include "neverhood/gamevars.h"
+ #include "neverhood/graphics.h"
++#include "neverhood/hdlayer.h"
+ #include "neverhood/resourceman.h"
+ #include "neverhood/resource.h"
+ #include "neverhood/screen.h"
+@@ -64,12 +68,221 @@ NeverhoodEngine::~NeverhoodEngine() {
+ 	delete _rnd;
+ }
+ 
+-Common::Error NeverhoodEngine::run() {
+-	initGraphics(640, 480);
++// Claybox: write every video's frames as PNGs, for upscaling on the user's Mac.
++// <out>/<HASH>/<NNNNN>.png, then an empty <out>/<HASH>/done when a video is complete.
++// Waits while a few finished videos are still waiting to be picked up, to keep disk use low.
++static void clayboxDumpVideos(ResourceMan *res, const Common::FSNode &out) {
++	Common::Array<uint32> hashes = res->getResourceHashes(kResTypeVideo);
++	{
++		Common::DumpFile total;
++		if (total.open(out.getChild("total.txt")))
++			total.writeString(Common::String::format("%u\n", hashes.size()));
++	}
++	for (uint i = 0; i < hashes.size(); i++) {
++		if (g_engine->shouldQuit())
++			return;
++		// throttle
++		for (;;) {
++			Common::FSList dirs;
++			out.getChildren(dirs, Common::FSNode::kListDirectoriesOnly);
++			if (dirs.size() < 3 || g_engine->shouldQuit())
++				break;
++			g_system->delayMillis(300);
++		}
++		const Common::String name = Common::String::format("%08X", hashes[i]);
++		Common::FSNode dir = out.getChild(name);
++		if (!dir.exists() && !dir.createDirectory())
++			continue;
++		Video::SmackerDecoder decoder;
++		Common::SeekableReadStream *stream = res->createStream(hashes[i]);
++		if (!stream || !decoder.loadStream(stream))
++			continue;
++		while (!decoder.endOfVideo()) {
++			const Graphics::Surface *frame = decoder.decodeNextFrame();
++			if (!frame)
++				break;
++			Common::DumpFile file;
++			if (file.open(dir.getChild(Common::String::format("%05d.png", decoder.getCurFrame()))))
++				Image::writePNG(file, *frame, decoder.getPalette(), 256);
++		}
++		Common::DumpFile done;
++		done.open(dir.getChild("done"));
++	}
++}
++
++// Claybox: write every animation frame for upscaling on the user's Mac:
++//   <out>/rgb/<ANIM>_<FFFF>.png   colors (transparent area filled with nearby colors, so edges stay clean)
++//   <out>/mask/<ANIM>_<FFFF>.png  white where the sprite is, black where it's transparent
++//   <out>/pal/<ANIM>.bin          the animation's own palette (1024 bytes)
++// Writes one sprite frame (8-bit pixels + palette) as colour PNG (transparent area grown from
++// its neighbours) and mask PNG, named <HASH>_<FFFF>.png.
++static void clayboxWriteSpriteFrame(const Graphics::Surface &index, int w, int h, const byte *pal,
++		const Common::FSNode &rgbDir, const Common::FSNode &maskDir, uint32 hash, uint frame) {
++	const Graphics::PixelFormat rgba = Graphics::PixelFormat::createFormatRGBA32();
++	Common::Array<int> r(w * h, -1), g(w * h), b(w * h);
++	for (int y = 0; y < h; y++)
++		for (int x = 0; x < w; x++) {
++			const byte c = *(const byte*)index.getBasePtr(x, y);
++			if (c) {
++				r[y * w + x] = pal[c * 4]; g[y * w + x] = pal[c * 4 + 1]; b[y * w + x] = pal[c * 4 + 2];
++			}
++		}
++	for (int pass = 0; pass < 6; pass++) {
++		Common::Array<int> nr(r), ng(g), nb(b);
++		for (int y = 0; y < h; y++)
++			for (int x = 0; x < w; x++) {
++				if (r[y * w + x] >= 0)
++					continue;
++				int sr = 0, sg = 0, sb = 0, n = 0;
++				for (int dy = -1; dy <= 1; dy++)
++					for (int dx = -1; dx <= 1; dx++) {
++						const int xx = x + dx, yy = y + dy;
++						if (xx < 0 || yy < 0 || xx >= w || yy >= h || r[yy * w + xx] < 0)
++							continue;
++						sr += r[yy * w + xx]; sg += g[yy * w + xx]; sb += b[yy * w + xx]; n++;
++					}
++				if (n) {
++					nr[y * w + x] = sr / n; ng[y * w + x] = sg / n; nb[y * w + x] = sb / n;
++				}
++			}
++		r = nr; g = ng; b = nb;
++	}
++	Graphics::Surface colors, mask;
++	colors.create(w, h, rgba);
++	mask.create(w, h, rgba);
++	for (int y = 0; y < h; y++)
++		for (int x = 0; x < w; x++) {
++			const int k = y * w + x;
++			const bool solid = *(const byte*)index.getBasePtr(x, y) != 0;
++			*(uint32*)colors.getBasePtr(x, y) = r[k] >= 0 ? rgba.RGBToColor(r[k], g[k], b[k]) : rgba.RGBToColor(0, 0, 0);
++			*(uint32*)mask.getBasePtr(x, y) = solid ? rgba.RGBToColor(255, 255, 255) : rgba.RGBToColor(0, 0, 0);
++		}
++	const Common::String frameName = Common::String::format("%08X_%04u.png", hash, frame);
++	Common::DumpFile cf, mf;
++	if (cf.open(rgbDir.getChild(frameName)))
++		Image::writePNG(cf, colors);
++	if (mf.open(maskDir.getChild(frameName)))
++		Image::writePNG(mf, mask);
++	colors.free();
++	mask.free();
++}
++
++static void clayboxWritePalette(const Common::FSNode &palDir, uint32 hash, const byte *pal) {
++	Common::DumpFile palFile;
++	if (palFile.open(palDir.getChild(Common::String::format("%08X.bin", hash))))
++		palFile.write(pal, 1024);
++}
++
++// Claybox: write every animation frame and every small (non-background) bitmap for upscaling:
++//   <out>/rgb/<HASH>_<FFFF>.png, <out>/mask/<HASH>_<FFFF>.png, <out>/pal/<HASH>.bin
++static void clayboxDumpSprites(NeverhoodEngine *vm, ResourceMan *res, const Common::FSNode &out) {
++	Common::FSNode rgbDir = out.getChild("rgb"), maskDir = out.getChild("mask"), palDir = out.getChild("pal");
++	rgbDir.createDirectory();
++	maskDir.createDirectory();
++	palDir.createDirectory();
++	uint frameTotal = 0;
++
++	// animations
++	Common::Array<uint32> hashes = res->getResourceHashes(kResTypeAnimation);
++	for (uint i = 0; i < hashes.size(); i++) {
++		if (g_engine->shouldQuit())
++			return;
++		AnimResource anim(vm);
++		if (!anim.load(hashes[i]) || !anim.getPaletteData())
++			continue;
++		clayboxWritePalette(palDir, hashes[i], anim.getPaletteData());
++		for (uint f = 0; f < anim.getFrameCount(); f++) {
++			const AnimFrameInfo &info = anim.getFrameInfo(f);
++			const int w = info.drawOffset.width, h = info.drawOffset.height;
++			if (w <= 0 || h <= 0 || w > 1024 || h > 1024)
++				continue;
++			Graphics::Surface index;
++			index.create((w + 3) & ~3, h, Graphics::PixelFormat::createFormatCLUT8());
++			index.fillRect(Common::Rect(0, 0, index.w, index.h), 0);
++			anim.draw(f, &index, false, false);
++			clayboxWriteSpriteFrame(index, w, h, anim.getPaletteData(), rgbDir, maskDir, hashes[i], f);
++			index.free();
++			frameTotal++;
++		}
++	}
++
++	// static objects: bitmaps smaller than the screen that carry their own palette
++	Common::Array<uint32> bitmaps = res->getResourceHashes(kResTypeBitmap);
++	for (uint i = 0; i < bitmaps.size(); i++) {
++		if (g_engine->shouldQuit())
++			return;
++		SpriteResource sprite(vm);
++		PaletteResource palette(vm);
++		if (!sprite.load(bitmaps[i]) || !palette.load(bitmaps[i]) || !palette.palette())
++			continue;
++		const int w = sprite.getDimensions().width, h = sprite.getDimensions().height;
++		if (w <= 0 || h <= 0 || (w >= 640 && h >= 480) || w > 1024 || h > 1024)
++			continue;
++		byte pal[1024];
++		palette.copyPalette(pal);
++		Graphics::Surface index;
++		index.create((w + 3) & ~3, h, Graphics::PixelFormat::createFormatCLUT8());
++		index.fillRect(Common::Rect(0, 0, index.w, index.h), 0);
++		sprite.draw(&index, false, false);
++		clayboxWritePalette(palDir, bitmaps[i], pal);
++		clayboxWriteSpriteFrame(index, w, h, pal, rgbDir, maskDir, bitmaps[i], 0);
++		index.free();
++		frameTotal++;
++	}
++
++	Common::DumpFile done;
++	if (done.open(out.getChild("done")))
++		done.writeString(Common::String::format("%u\n", frameTotal));
++}
+ 
++Common::Error NeverhoodEngine::run() {
+ 	const Common::FSNode gameDataDir(ConfMan.getPath("path"));
+ 	const Common::Path extraPath(ConfMan.getPath("extrapath"));
+ 
++	if (ConfMan.hasKey("claybox_dump_videos") || ConfMan.hasKey("claybox_dump_sprites")) {
++		SearchMan.addSubDirectoryMatching(gameDataDir, "data");
++		_res = new ResourceMan();
++		_res->addArchive("a.blb");
++		_res->addArchive("c.blb");
++		_res->addArchive("hd.blb");
++		_res->addArchive("i.blb");
++		_res->addArchive("m.blb", true);
++		_res->addArchive("s.blb");
++		_res->addArchive("t.blb");
++		if (ConfMan.hasKey("claybox_dump_sprites"))
++			clayboxDumpSprites(this, _res, Common::FSNode(ConfMan.getPath("claybox_dump_sprites")));
++		else
++			clayboxDumpVideos(_res, Common::FSNode(ConfMan.getPath("claybox_dump_videos")));
++		delete _res;
++		_res = nullptr;
++		return Common::kNoError;
++	}
++
++	// Claybox HD: use HD backgrounds if the user has generated them.
++	// Folder: the "claybox_hd_path" setting, or "claybox-hd" inside the extra path.
++	_hdEnabled = false;
++	if (ConfMan.hasKey("claybox_hd_path"))
++		_hdDir = Common::FSNode(ConfMan.getPath("claybox_hd_path"));
++	else if (!extraPath.empty())
++		_hdDir = Common::FSNode(extraPath).getChild("claybox-hd");
++	// claybox_hd=true turns HD on even while the folder is still being filled
++	// (Claybox upscales in the background; each scene picks up its image once it exists).
++	const bool hdForced = ConfMan.hasKey("claybox_hd") && ConfMan.getBool("claybox_hd") && _hdDir.exists();
++	const bool hdOff = ConfMan.hasKey("claybox_hd") && !ConfMan.getBool("claybox_hd");
++	if (!hdOff && (hdForced || HDLayer::folderHasImages(_hdDir))) {
++		initGraphics(640 * HDLayer::kScale, 480 * HDLayer::kScale, _system->getSupportedFormats());
++		if (_system->getScreenFormat().bytesPerPixel == 4) {
++			_hdEnabled = true;
++			_system->logMessage(LogMessageType::kInfo, Common::String::format("Claybox HD: ON (1280x960), images from %s\n", _hdDir.getPath().toString().c_str()).c_str());
++		} else {
++			warning("Claybox HD: no 32-bit screen mode available, using original graphics");
++		}
++	}
++	if (!_hdEnabled) {
++		initGraphics(640, 480);
++		_system->logMessage(LogMessageType::kInfo, "Claybox HD: OFF (original 640x480)\n");
++	}
++
+ 	SearchMan.addSubDirectoryMatching(gameDataDir, "data");
+ 	SearchMan.addSubDirectoryMatching(gameDataDir, "language");
+ 
+@@ -91,6 +304,10 @@ Common::Error NeverhoodEngine::run() {
+ 	_staticData->load("neverhood.dat");
+ 	_gameVars = new GameVars();
+ 	_screen = new Screen(this);
++	if (_screen->getHDLayer() && ConfMan.hasKey("claybox_video_path"))
++		_screen->getHDLayer()->setVideoDir(Common::FSNode(ConfMan.getPath("claybox_video_path")));
++	if (_screen->getHDLayer() && ConfMan.hasKey("claybox_sprite_path"))
++		_screen->getHDLayer()->setSpriteDir(Common::FSNode(ConfMan.getPath("claybox_sprite_path")));
+ 	_res = new ResourceMan();
+ 	setDebugger(new Console(this));
+ 
+@@ -190,6 +407,11 @@ void NeverhoodEngine::mainLoop() {
+ 		Common::Event event;
+ 		Common::EventManager *eventMan = _system->getEventManager();
+ 		while (eventMan->pollEvent(event)) {
++			// Claybox HD: the game logic works in 640x480 coordinates
++			if (_hdEnabled) {
++				event.mouse.x /= HDLayer::kScale;
++				event.mouse.y /= HDLayer::kScale;
++			}
+ 			switch (event.type) {
+ 			case Common::EVENT_CUSTOM_ENGINE_ACTION_START:
+ 				_gameModule->handleKeyDown(event.customType);
+diff --git a/engines/neverhood/neverhood.h b/engines/neverhood/neverhood.h
+index db3b9e67..c3650b29 100644
+--- a/engines/neverhood/neverhood.h
++++ b/engines/neverhood/neverhood.h
+@@ -24,6 +24,7 @@
+ 
+ #include "common/scummsys.h"
+ #include "common/events.h"
++#include "common/fs.h"
+ #include "common/keyboard.h"
+ #include "common/random.h"
+ #include "common/savefile.h"
+@@ -92,6 +93,10 @@ public:
+ 	int16 _mouseX, _mouseY;
+ 	uint16 _buttonState;
+ 
++	// Claybox HD: set up in run() before the screen is created
++	bool _hdEnabled;
++	Common::FSNode _hdDir;
++
+ 	GameState _gameState;
+ 	GameVars *_gameVars;
+ 	Screen *_screen;
+diff --git a/engines/neverhood/resource.h b/engines/neverhood/resource.h
+index ad471dee..9ff68742 100644
+--- a/engines/neverhood/resource.h
++++ b/engines/neverhood/resource.h
+@@ -59,6 +59,7 @@ public:
+ 	NPoint& getPosition() { return _position; }
+ 	bool isRle() const { return _rle; }
+ 	const byte *getPixels() const { return _pixels; }
++	uint32 getFileHash() const { return _resourceHandle.isValid() ? _resourceHandle.fileHash() : 0; }
+ protected:
+ 	NeverhoodEngine *_vm;
+ 	ResourceHandle _resourceHandle;
+@@ -105,6 +106,10 @@ public:
+ 	void setReplEnabled(bool value) { _replEnabled = value; }
+ 	void setRepl(byte oldColor, byte newColor);
+ 	NDimensions loadSpriteDimensions(uint32 fileHash);
++	// Claybox HD
++	uint32 getFileHash() const { return _fileHash; }
++	const byte *getPaletteData() const { return _paletteData; }
++	bool isReplacingColors() const { return _replEnabled && _replOldColor != _replNewColor; }
+ protected:
+ 	NeverhoodEngine *_vm;
+ 	ResourceHandle _resourceHandle;
+diff --git a/engines/neverhood/resourceman.cpp b/engines/neverhood/resourceman.cpp
+index 726c1700..ae880efc 100644
+--- a/engines/neverhood/resourceman.cpp
++++ b/engines/neverhood/resourceman.cpp
+@@ -19,10 +19,21 @@
+  *
+  */
+ 
++#include "common/algorithm.h"
+ #include "neverhood/resourceman.h"
+ 
+ namespace Neverhood {
+ 
++Common::Array<uint32> ResourceMan::getResourceHashes(byte type) {
++	Common::Array<uint32> hashes;
++	for (EntriesMap::iterator it = _entries.begin(); it != _entries.end(); ++it)
++		if (it->_value.archiveEntry && it->_value.archiveEntry->type == type &&
++			(it->_value.archiveEntry->comprType == 1 || it->_value.archiveEntry->comprType == 3))
++			hashes.push_back(it->_key);
++	Common::sort(hashes.begin(), hashes.end());
++	return hashes;
++}
++
+ ResourceHandle::ResourceHandle()
+ 	: _resourceFileEntry(nullptr), _data(nullptr) {
+ }
+diff --git a/engines/neverhood/resourceman.h b/engines/neverhood/resourceman.h
+index 2decc596..8f84d2c8 100644
+--- a/engines/neverhood/resourceman.h
++++ b/engines/neverhood/resourceman.h
+@@ -122,6 +122,8 @@ public:
+ 	void loadResource(ResourceHandle &resourceHandle, bool applyResourceFixes);
+ 	void unloadResource(ResourceHandle &resourceHandle);
+ 	void purgeResources();
++	// Claybox: all resource hashes of one type (e.g. kResTypeVideo), sorted
++	Common::Array<uint32> getResourceHashes(byte type);
+ protected:
+ 	typedef Common::HashMap<uint32, ResourceFileEntry> EntriesMap;
+ 	Common::Array<BlbArchive*> _archives;
+diff --git a/engines/neverhood/screen.cpp b/engines/neverhood/screen.cpp
+index 11e8c632..fefde6f5 100644
+--- a/engines/neverhood/screen.cpp
++++ b/engines/neverhood/screen.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include "graphics/paletteman.h"
+ #include "video/smk_decoder.h"
++#include "common/config-manager.h"
+ #include "neverhood/screen.h"
+ 
+ namespace Neverhood {
+@@ -39,9 +40,50 @@ Screen::Screen(NeverhoodEngine *vm)
+ 	_prevRenderQueue = new RenderQueue();
+ 	_microTiles = new MicroTileArray(640, 480);
+ 
++	_hd = nullptr;
++	_hdScreen = nullptr;
++	_hdOwner = nullptr;
++	_hdSource = nullptr;
++	_hdUnderOwner = nullptr;
++	_hdUnderSource = nullptr;
++	_hdUnderIndex = nullptr;
++	_hdShadow = nullptr;
++	_hdPaletteDirty = true;
++	_hdSmooth = !ConfMan.hasKey("claybox_smooth") || ConfMan.getBool("claybox_smooth");
++	memset(_hdPalette, 0, sizeof(_hdPalette));
++	if (_vm->_hdEnabled) {
++		const Graphics::PixelFormat format = _vm->_system->getScreenFormat();
++		_hd = new HDLayer(_vm, _vm->_hdDir, format);
++		_hdScreen = new Graphics::Surface();
++		_hdScreen->create(640 * HDLayer::kScale, 480 * HDLayer::kScale, format);
++		_hdOwner = new byte[640 * 480];
++		memset(_hdOwner, 0, 640 * 480);
++		_hdSource = new int16[640 * 480 * 2];
++		memset(_hdSource, 0, 640 * 480 * 2 * sizeof(int16));
++		_hdUnderOwner = new byte[640 * 480];
++		memset(_hdUnderOwner, 0, 640 * 480);
++		_hdUnderSource = new int16[640 * 480 * 2];
++		memset(_hdUnderSource, 0, 640 * 480 * 2 * sizeof(int16));
++		_hdUnderIndex = new byte[640 * 480];
++		memset(_hdUnderIndex, 0, 640 * 480);
++		_hdShadow = new byte[640 * 480];
++		memset(_hdShadow, 0, 640 * 480);
++	}
++
+ }
+ 
+ Screen::~Screen() {
++	if (_hdScreen) {
++		_hdScreen->free();
++		delete _hdScreen;
++	}
++	delete[] _hdOwner;
++	delete[] _hdSource;
++	delete[] _hdUnderOwner;
++	delete[] _hdUnderSource;
++	delete[] _hdUnderIndex;
++	delete[] _hdShadow;
++	delete _hd;
+ 	delete _microTiles;
+ 	delete _renderQueue;
+ 	delete _prevRenderQueue;
+@@ -55,8 +97,12 @@ void Screen::update() {
+ 
+ 	if (_fullRefresh) {
+ 		// NOTE When playing a fullscreen/doubled Smacker video usually a full screen refresh is needed
+-		_vm->_system->copyRectToScreen((const byte*)_backScreen->getPixels(), _backScreen->pitch, 0, 0, 640, 480);
++		if (_hd)
++			hdPresent(Common::Rect(0, 0, 640, 480));
++		else
++			_vm->_system->copyRectToScreen((const byte*)_backScreen->getPixels(), _backScreen->pitch, 0, 0, 640, 480);
+ 		_fullRefresh = false;
++		_hdPaletteDirty = false;
+ 		return;
+ 	}
+ 
+@@ -98,9 +144,18 @@ void Screen::update() {
+ 	SWAP(_renderQueue, _prevRenderQueue);
+ 	_renderQueue->clear();
+ 
+-	for (RectangleList::iterator ri = updateRects->begin(); ri != updateRects->end(); ++ri) {
+-		Common::Rect &r = *ri;
+-		_vm->_system->copyRectToScreen((const byte*)_backScreen->getBasePtr(r.left, r.top), _backScreen->pitch, r.left, r.top, r.width(), r.height());
++	if (_hd && _hdPaletteDirty) {
++		// A palette change (e.g. a fade) recolors the whole screen.
++		hdPresent(Common::Rect(0, 0, 640, 480));
++		_hdPaletteDirty = false;
++	} else {
++		for (RectangleList::iterator ri = updateRects->begin(); ri != updateRects->end(); ++ri) {
++			Common::Rect &r = *ri;
++			if (_hd)
++				hdPresent(r);
++			else
++				_vm->_system->copyRectToScreen((const byte*)_backScreen->getBasePtr(r.left, r.top), _backScreen->pitch, r.left, r.top, r.width(), r.height());
++		}
+ 	}
+ 
+ 	delete updateRects;
+@@ -161,7 +216,14 @@ void Screen::testPalette(byte *paletteData) {
+ }
+ 
+ void Screen::updatePalette() {
+-	if (_paletteChanged && _paletteData) {
++	if (_paletteChanged && _paletteData && _hd) {
++		// The HD screen is true color: keep the palette ourselves and recolor on the next present.
++		if (memcmp(_hdPalette, _paletteData, 1024) != 0) {
++			memcpy(_hdPalette, _paletteData, 1024);
++			_hdPaletteDirty = true;
++		}
++		_paletteChanged = false;
++	} else if (_paletteChanged && _paletteData) {
+ 		byte *tempPalette = new byte[768];
+ 		for (int i = 0; i < 256; i++) {
+ 			tempPalette[i * 3 + 0] = _paletteData[i * 4 + 0];
+@@ -176,6 +238,10 @@ void Screen::updatePalette() {
+ 
+ void Screen::clear() {
+ 	memset(_backScreen->getPixels(), 0, _backScreen->pitch * _backScreen->h);
++	if (_hdOwner) {
++		memset(_hdOwner, 0, 640 * 480);
++		memset(_hdShadow, 0, 640 * 480);
++	}
+ 	_fullRefresh = true;
+ 	clearRenderQueue();
+ }
+@@ -258,6 +324,7 @@ void Screen::drawSurface3(const Graphics::Surface *surface, int16 x, int16 y, ND
+ 
+ void Screen::drawDoubleSurface2(const Graphics::Surface *surface, NDrawRect &drawRect) {
+ 
++	const byte hdId = _hd ? _hd->findImageId(surface) : 0;
+ 	const byte *source = (const byte*)surface->getPixels();
+ 	byte *dest = (byte*)_backScreen->getBasePtr(drawRect.x, drawRect.y);
+ 
+@@ -270,6 +337,13 @@ void Screen::drawDoubleSurface2(const Graphics::Surface *surface, NDrawRect &dra
+ 		memcpy(dest + _backScreen->pitch, dest, surface->w * 2);
+ 		dest += _backScreen->pitch;
+ 		dest += _backScreen->pitch;
++		if (hdId) {
++			hdSetOwner(drawRect.x, drawRect.y + yc * 2, surface->w * 2, hdId | HDLayer::kDoubledFlag, 0, yc * 2);
++			hdSetOwner(drawRect.x, drawRect.y + yc * 2 + 1, surface->w * 2, hdId | HDLayer::kDoubledFlag, 0, yc * 2 + 1);
++		} else {
++			hdClearOwner(drawRect.x, drawRect.y + yc * 2, surface->w * 2);
++			hdClearOwner(drawRect.x, drawRect.y + yc * 2 + 1, surface->w * 2);
++		}
+ 	}
+ 
+ 	_fullRefresh = true; // See Screen::update
+@@ -289,6 +363,8 @@ void Screen::drawDoubleSurface2Alpha(const Graphics::Surface *surface, NDrawRect
+ 				row[1] = *source;
+ 				row[_backScreen->pitch] = *source;
+ 				row[_backScreen->pitch + 1] = *source;
++				hdClearOwner(drawRect.x + xc * 2, drawRect.y + yc * 2, 2);
++				hdClearOwner(drawRect.x + xc * 2, drawRect.y + yc * 2 + 1, 2);
+ 			}
+ 			source++;
+ 			row += 2;
+@@ -413,43 +489,354 @@ void Screen::blitRenderItem(const RenderItem &renderItem, const Common::Rect &cl
+ 	if (width < 0 || height < 0)
+ 		return;
+ 
+-	const byte *source = (const byte*)surface->getBasePtr(renderItem._srcX + x0 - renderItem._destX, renderItem._srcY + y0 - renderItem._destY);
++	const int16 srcX0 = renderItem._srcX + x0 - renderItem._destX;
++	const int16 srcY0 = renderItem._srcY + y0 - renderItem._destY;
++	const byte *source = (const byte*)surface->getBasePtr(srcX0, srcY0);
+ 	byte *dest = (byte*)_backScreen->getBasePtr(x0, y0);
++	byte *owner = _hdOwner ? _hdOwner + y0 * 640 + x0 : nullptr;
+ 
+ 	if (shadowSurface) {
+ 		const byte *shadowSource = (const byte*)shadowSurface->getBasePtr(x0, y0);
+ 		while (height--) {
+ 			for (int xc = 0; xc < width; xc++)
+-				if (source[xc] != 0)
++				if (source[xc] != 0) {
++					if (owner) {
++						const int p = (int)(owner - _hdOwner) + xc;
++						const HDImage *under = owner[xc] ? _hd->getImage(owner[xc] & ~HDLayer::kDoubledFlag) : nullptr;
++						if (under && !under->sprite && !under->video && !(owner[xc] & HDLayer::kDoubledFlag)) {
++							// keep the HD background, remember its own color to darken it toward the shadow
++							if (!_hdShadow[p])
++								_hdUnderIndex[p] = dest[xc];
++							_hdShadow[p] = 1;
++						} else {
++							owner[xc] = 0;
++							_hdShadow[p] = 0;
++						}
++					}
+ 					dest[xc] = shadowSource[xc];
++				}
+ 			source += surface->pitch;
+ 			shadowSource += shadowSurface->pitch;
+ 			dest += _backScreen->pitch;
++			if (owner)
++				owner += 640;
+ 		}
+ 	} else if (!renderItem._transparent) {
+-		while (height--) {
++		const byte hdId = _hd ? _hd->findImageId(surface) : 0;
++		for (int16 yc = 0; yc < height; yc++) {
+ 			memcpy(dest, source, width);
+ 			source += surface->pitch;
+ 			dest += _backScreen->pitch;
+-		}
+-	} else if (renderItem._alphaColor == 0) {
+-		while (height--) {
+-			for (int xc = 0; xc < width; xc++)
+-				if (source[xc] != 0)
+-					dest[xc] = source[xc];
+-			source += surface->pitch;
+-			dest += _backScreen->pitch;
++			if (_hd) {
++				if (hdId)
++					hdSetOwner(x0, y0 + yc, width, hdId, srcX0, srcY0 + yc);
++				else
++					hdClearOwner(x0, y0 + yc, width);
++			}
+ 		}
+ 	} else {
+-		while (height--) {
+-			for (int xc = 0; xc < width; xc++)
+-				if (source[xc] != renderItem._alphaColor)
++		const byte alphaColor = renderItem._alphaColor;
++		const HDImage *spriteImage = nullptr;
++		byte spriteId = 0;
++		if (_hd) {
++			spriteId = _hd->findImageId(surface);
++			spriteImage = spriteId ? _hd->getImage(spriteId) : nullptr;
++			if (!spriteImage || !spriteImage->sprite)
++				spriteId = 0;
++		}
++		for (int16 yc = 0; yc < height; yc++) {
++			for (int xc = 0; xc < width; xc++) {
++				if (source[xc] == alphaColor) {
++					// outside the original outline: let the HD sprite's soft edge spill over
++					if (spriteId && owner && owner[xc] != spriteId) {
++						const int hx = (srcX0 + xc) * 2, hy = (srcY0 + yc) * 2;
++						const Graphics::Surface &f = spriteImage->surface;
++						if (hx >= 0 && hy >= 0 && hx + 1 < f.w && hy + 1 < f.h) {
++							const Graphics::PixelFormat sf = HDLayer::spriteFormat();
++							byte a0, a1, a2, a3, r, g, b;
++							sf.colorToARGB(*(const uint32*)f.getBasePtr(hx, hy), a0, r, g, b);
++							sf.colorToARGB(*(const uint32*)f.getBasePtr(hx + 1, hy), a1, r, g, b);
++							sf.colorToARGB(*(const uint32*)f.getBasePtr(hx, hy + 1), a2, r, g, b);
++							sf.colorToARGB(*(const uint32*)f.getBasePtr(hx + 1, hy + 1), a3, r, g, b);
++							if (a0 + a1 + a2 + a3 > 24) {
++								const int p = (y0 + yc) * 640 + x0 + xc;
++								_hdUnderOwner[p] = _hdShadow[p] ? 0 : owner[xc];
++								_hdUnderSource[p * 2] = _hdSource[p * 2];
++								_hdUnderSource[p * 2 + 1] = _hdSource[p * 2 + 1];
++								_hdUnderIndex[p] = dest[xc];
++								_hdShadow[p] = 0;
++								owner[xc] = spriteId;
++								_hdSource[p * 2] = srcX0 + xc;
++								_hdSource[p * 2 + 1] = srcY0 + yc;
++							}
++						}
++					}
++					continue;
++				}
++				{
++					if (owner) {
++						if (spriteId) {
++							// remember what's underneath, for the sprite's soft edges
++							const int p = (y0 + yc) * 640 + x0 + xc;
++							_hdUnderOwner[p] = owner[xc];
++							_hdUnderSource[p * 2] = _hdSource[p * 2];
++							_hdUnderSource[p * 2 + 1] = _hdSource[p * 2 + 1];
++							_hdUnderIndex[p] = dest[xc];
++							owner[xc] = spriteId;
++							_hdSource[p * 2] = srcX0 + xc;
++							_hdSource[p * 2 + 1] = srcY0 + yc;
++							_hdShadow[p] = 0;
++						} else {
++							owner[xc] = 0;
++							_hdShadow[(y0 + yc) * 640 + x0 + xc] = 0;
++						}
++					}
+ 					dest[xc] = source[xc];
++				}
++			}
+ 			source += surface->pitch;
+ 			dest += _backScreen->pitch;
++			if (owner)
++				owner += 640;
+ 		}
+ 	}
+ 
+ }
+ 
++// Claybox HD
++
++void Screen::hdSetOwner(int16 x, int16 y, int16 width, byte id, int16 srcX, int16 srcY) {
++	if (!_hdOwner || y < 0 || y >= 480)
++		return;
++	byte *owner = _hdOwner + y * 640;
++	int16 *src = _hdSource + (y * 640) * 2;
++	for (int16 xc = 0; xc < width; xc++) {
++		const int16 x1 = x + xc;
++		if (x1 < 0 || x1 >= 640)
++			continue;
++		owner[x1] = id;
++		_hdShadow[y * 640 + x1] = 0;
++		src[x1 * 2 + 0] = srcX + xc;
++		src[x1 * 2 + 1] = srcY;
++	}
++}
++
++void Screen::hdClearOwner(int16 x, int16 y, int16 width) {
++	if (!_hdOwner || y < 0 || y >= 480)
++		return;
++	const int16 x0 = MAX<int16>(x, 0);
++	const int16 x1 = MIN<int16>(x + width, 640);
++	if (x1 > x0) {
++		memset(_hdOwner + y * 640 + x0, 0, x1 - x0);
++		memset(_hdShadow + y * 640 + x0, 0, x1 - x0);
++	}
++}
++
++// Maps a channel value of the HD image, made with palette color `base`,
++// to where the game's current palette color `cur` has moved it (fades).
++static inline byte hdAdjust(byte v, byte base, byte cur) {
++	if (cur == base)
++		return v;
++	if (cur < base)
++		return (byte)((uint32)v * cur / base);
++	return (byte)(v + (uint32)(cur - base) * (255 - v) / (255 - base));
++}
++
++void Screen::hdCompose(const Common::Rect &r) {
++	const Graphics::PixelFormat &format = _hdScreen->format;
++	const int s = HDLayer::kScale;
++
++	uint32 lut[256];
++	byte rgb[256 * 3];
++	for (int i = 0; i < 256; i++) {
++		lut[i] = format.RGBToColor(_hdPalette[i * 4 + 0], _hdPalette[i * 4 + 1], _hdPalette[i * 4 + 2]);
++		rgb[i * 3 + 0] = _hdPalette[i * 4 + 0];
++		rgb[i * 3 + 1] = _hdPalette[i * 4 + 1];
++		rgb[i * 3 + 2] = _hdPalette[i * 4 + 2];
++	}
++
++	const HDImage *lastImage = nullptr;
++	bool sameColor[256];
++
++	for (int16 y = r.top; y < r.bottom; y++) {
++		const byte *back = (const byte*)_backScreen->getBasePtr(0, y);
++		const byte *owner = _hdOwner + y * 640;
++		const int16 *src = _hdSource + (y * 640) * 2;
++		uint32 *rows[HDLayer::kScale];
++		for (int j = 0; j < s; j++)
++			rows[j] = (uint32*)_hdScreen->getBasePtr(0, y * s + j);
++
++		for (int16 x = r.left; x < r.right; x++) {
++			const byte index = back[x];
++			const HDImage *image = owner[x] ? _hd->getImage(owner[x] & ~HDLayer::kDoubledFlag) : nullptr;
++			if (image && image->sprite) {
++				const int p = y * 640 + x;
++				const int sx = src[x * 2 + 0] * 2, sy = src[x * 2 + 1] * 2;
++				const Graphics::Surface &f = image->surface;
++				if (sx >= 0 && sy >= 0 && sx + 1 < f.w && sy + 1 < f.h && s == 2) {
++					const Graphics::PixelFormat sf = HDLayer::spriteFormat();
++					const bool spill = index == _hdUnderIndex[p];   // outside the original outline
++					const byte *base = image->basePalette + index * 4;
++					const byte *cur = _hdPalette + index * 4;
++					for (int j = 0; j < 2; j++)
++						for (int i = 0; i < 2; i++) {
++							byte a, cr, cg, cb;
++							sf.colorToARGB(*(const uint32*)f.getBasePtr(sx + i, sy + j), a, cr, cg, cb);
++							if (!spill) {
++								cr = hdAdjust(cr, base[0], cur[0]);
++								cg = hdAdjust(cg, base[1], cur[1]);
++								cb = hdAdjust(cb, base[2], cur[2]);
++							}
++							uint32 out;
++							if (a >= 250) {
++								out = format.RGBToColor(cr, cg, cb);
++							} else {
++								byte ur, ug, ub;
++								format.colorToRGB(hdSampleUnder(p, i, j, lut), ur, ug, ub);
++								out = format.RGBToColor((cr * a + ur * (255 - a)) / 255,
++									(cg * a + ug * (255 - a)) / 255, (cb * a + ub * (255 - a)) / 255);
++							}
++							rows[j][x * 2 + i] = out;
++						}
++					continue;
++				}
++				image = nullptr;
++			}
++			if (image && (owner[x] & HDLayer::kDoubledFlag)) {
++				// a 2x-doubled video: its HD frame has one pixel per screen pixel here,
++				// so smooth it up to the HD screen like the rest
++				const int sx = src[x * 2 + 0], sy = src[x * 2 + 1];
++				const Graphics::Surface &f = image->surface;
++				if (sx < 0 || sy < 0 || sx >= f.w || sy >= f.h) {
++					image = nullptr;
++				} else {
++					const int sxr = MIN<int>(sx + 1, f.w - 1), syd = MIN<int>(sy + 1, f.h - 1);
++					const uint32 c = *(const uint32*)f.getBasePtr(sx, sy);
++					const uint32 cr = *(const uint32*)f.getBasePtr(sxr, sy);
++					const uint32 cd = *(const uint32*)f.getBasePtr(sx, syd);
++					const uint32 crd = *(const uint32*)f.getBasePtr(sxr, syd);
++					byte r0, g0, b0, r1, g1, b1, r2, g2, b2, r3, g3, b3;
++					format.colorToRGB(c, r0, g0, b0);
++					format.colorToRGB(cr, r1, g1, b1);
++					format.colorToRGB(cd, r2, g2, b2);
++					format.colorToRGB(crd, r3, g3, b3);
++					rows[0][x * 2] = c;
++					rows[0][x * 2 + 1] = format.RGBToColor((r0 + r1) >> 1, (g0 + g1) >> 1, (b0 + b1) >> 1);
++					rows[1][x * 2] = format.RGBToColor((r0 + r2) >> 1, (g0 + g2) >> 1, (b0 + b2) >> 1);
++					rows[1][x * 2 + 1] = format.RGBToColor((r0 + r1 + r2 + r3) >> 2, (g0 + g1 + g2 + g3) >> 2, (b0 + b1 + b2 + b3) >> 2);
++					continue;
++				}
++			}
++			if (image) {
++				const int16 sx = src[x * 2 + 0] * s;
++				const int16 sy = src[x * 2 + 1] * s;
++				if (sx < 0 || sy < 0 || sx + s > image->surface.w || sy + s > image->surface.h)
++					image = nullptr;
++				else {
++					if (_hdShadow[y * 640 + x]) {
++						// a shadow: the HD background (in its own colors), darkened like the original
++						const byte orig = _hdUnderIndex[y * 640 + x];
++						const byte *co = rgb + orig * 3, *cs = rgb + index * 3;
++						for (int j = 0; j < s; j++)
++							for (int i = 0; i < s; i++) {
++								byte cr, cg, cb;
++								format.colorToRGB(hdSampleImage(image, sx + i, sy + j, orig), cr, cg, cb);
++								rows[j][x * s + i] = format.RGBToColor(co[0] ? MIN<int>(255, cr * cs[0] / co[0]) : cs[0],
++									co[1] ? MIN<int>(255, cg * cs[1] / co[1]) : cs[1], co[2] ? MIN<int>(255, cb * cs[2] / co[2]) : cs[2]);
++							}
++						continue;
++					}
++					if (image != lastImage) {
++						lastImage = image;
++						for (int i = 0; i < 256; i++)
++							sameColor[i] = image->video || memcmp(image->basePalette + i * 4, _hdPalette + i * 4, 3) == 0;
++					}
++					const byte *base = image->basePalette + index * 4;
++					const byte *cur = _hdPalette + index * 4;
++					for (int j = 0; j < s; j++) {
++						const uint32 *in = (const uint32*)image->surface.getBasePtr(sx, sy + j);
++						uint32 *out = rows[j] + x * s;
++						if (sameColor[index]) {
++							for (int i = 0; i < s; i++)
++								out[i] = in[i];
++						} else {
++							for (int i = 0; i < s; i++) {
++								byte cr, cg, cb;
++								format.colorToRGB(in[i], cr, cg, cb);
++								out[i] = format.RGBToColor(hdAdjust(cr, base[0], cur[0]),
++									hdAdjust(cg, base[1], cur[1]), hdAdjust(cb, base[2], cur[2]));
++							}
++						}
++					}
++				}
++			}
++			if (!image) {
++				if (_hdSmooth && s == 2) {
++					// Smooth 2x for everything without an HD image (videos, characters):
++					// each output pixel blends toward its right/lower neighbours.
++					const int xr = MIN<int>(x + 1, 639);
++					const byte *backDown = (const byte*)_backScreen->getBasePtr(0, MIN<int>(y + 1, 479));
++					const byte *c = rgb + index * 3;
++					const byte *cr = rgb + back[xr] * 3;
++					const byte *cd = rgb + backDown[x] * 3;
++					const byte *crd = rgb + backDown[xr] * 3;
++					rows[0][x * 2] = lut[index];
++					rows[0][x * 2 + 1] = format.RGBToColor((c[0] + cr[0]) >> 1, (c[1] + cr[1]) >> 1, (c[2] + cr[2]) >> 1);
++					rows[1][x * 2] = format.RGBToColor((c[0] + cd[0]) >> 1, (c[1] + cd[1]) >> 1, (c[2] + cd[2]) >> 1);
++					rows[1][x * 2 + 1] = format.RGBToColor((c[0] + cr[0] + cd[0] + crd[0]) >> 2,
++						(c[1] + cr[1] + cd[1] + crd[1]) >> 2, (c[2] + cr[2] + cd[2] + crd[2]) >> 2);
++				} else {
++					const uint32 color = lut[index];
++					for (int j = 0; j < s; j++)
++						for (int i = 0; i < s; i++)
++							rows[j][x * s + i] = color;
++				}
++			}
++		}
++	}
++}
++
++uint32 Screen::hdSampleImage(const HDImage *image, int x, int y, byte index) {
++	const Graphics::PixelFormat &format = _hdScreen->format;
++	const uint32 c = *(const uint32*)image->surface.getBasePtr(x, y);
++	if (image->video)
++		return c;
++	const byte *base = image->basePalette + index * 4;
++	const byte *cur = _hdPalette + index * 4;
++	if (base[0] == cur[0] && base[1] == cur[1] && base[2] == cur[2])
++		return c;
++	byte cr, cg, cb;
++	format.colorToRGB(c, cr, cg, cb);
++	return format.RGBToColor(hdAdjust(cr, base[0], cur[0]), hdAdjust(cg, base[1], cur[1]), hdAdjust(cb, base[2], cur[2]));
++}
++
++// The color under an HD sprite's sub-pixel (i, j) of logical pixel p.
++uint32 Screen::hdSampleUnder(int p, int i, int j, const uint32 *lut) {
++	const byte uid = _hdUnderOwner[p];
++	const byte uindex = _hdUnderIndex[p];
++	const HDImage *u = (uid && !(uid & HDLayer::kDoubledFlag)) ? _hd->getImage(uid) : nullptr;
++	if (u && !u->sprite) {
++		const int ux = _hdUnderSource[p * 2] * 2 + i, uy = _hdUnderSource[p * 2 + 1] * 2 + j;
++		if (ux >= 0 && uy >= 0 && ux < u->surface.w && uy < u->surface.h)
++			return hdSampleImage(u, ux, uy, uindex);
++	}
++	return lut[uindex];
++}
++
++void Screen::hdPresent(const Common::Rect &r) {
++	Common::Rect rect(r);
++	// smoothing reads the right/lower neighbours, so pixels just left/above a change change too
++	if (_hdSmooth) {
++		rect.left -= 1;
++		rect.top -= 1;
++	}
++	rect.clip(Common::Rect(0, 0, 640, 480));
++	if (rect.isEmpty())
++		return;
++	hdCompose(rect);
++	const int s = HDLayer::kScale;
++	_vm->_system->copyRectToScreen(_hdScreen->getBasePtr(rect.left * s, rect.top * s), _hdScreen->pitch,
++		rect.left * s, rect.top * s, rect.width() * s, rect.height() * s);
++}
++
+ } // End of namespace Neverhood
+diff --git a/engines/neverhood/screen.h b/engines/neverhood/screen.h
+index 7bd2f3b4..6ae4ffff 100644
+--- a/engines/neverhood/screen.h
++++ b/engines/neverhood/screen.h
+@@ -27,6 +27,7 @@
+ #include "neverhood/neverhood.h"
+ #include "neverhood/microtiles.h"
+ #include "neverhood/graphics.h"
++#include "neverhood/hdlayer.h"
+ 
+ namespace Video {
+ 	class SmackerDecoder;
+@@ -91,7 +92,29 @@ public:
+ 	void queueBlit(const Graphics::Surface *surface, int16 destX, int16 destY, NRect &ddRect, bool transparent, byte version,
+ 		       const Graphics::Surface *shadowSurface = NULL, byte alphaColor = 0);
+ 	void blitRenderItem(const RenderItem &renderItem, const Common::Rect &clipRect);
++	// Claybox HD
++	bool isHD() const { return _hd != nullptr; }
++	HDLayer *getHDLayer() { return _hd; }
++	int getScale() const { return _hd ? HDLayer::kScale : 1; }
+ protected:
++	HDLayer *_hd;
++	Graphics::Surface *_hdScreen;
++	byte *_hdOwner;      // per logical pixel: HD image id, 0 = use original pixel
++	int16 *_hdSource;    // per logical pixel: source x, y inside the HD image (logical units)
++	// what was under an HD sprite pixel (for its soft edges)
++	byte *_hdUnderOwner;
++	int16 *_hdUnderSource;
++	byte *_hdUnderIndex;
++	byte *_hdShadow;     // 1 where a character's shadow darkens an HD background
++	uint32 hdSampleUnder(int p, int i, int j, const uint32 *lut);
++	uint32 hdSampleImage(const HDImage *image, int x, int y, byte index);
++	byte _hdPalette[1024];
++	bool _hdPaletteDirty;
++	bool _hdSmooth;
++	void hdSetOwner(int16 x, int16 y, int16 width, byte id, int16 srcX, int16 srcY);
++	void hdClearOwner(int16 x, int16 y, int16 width);
++	void hdCompose(const Common::Rect &r);
++	void hdPresent(const Common::Rect &r);
+ 	NeverhoodEngine *_vm;
+ 	MicroTileArray *_microTiles;
+ 	Graphics::Surface *_backScreen;
+diff --git a/engines/neverhood/smackerplayer.cpp b/engines/neverhood/smackerplayer.cpp
+index 79812aa9..90f6e8d2 100644
+--- a/engines/neverhood/smackerplayer.cpp
++++ b/engines/neverhood/smackerplayer.cpp
+@@ -24,6 +24,7 @@
+ #include "neverhood/palette.h"
+ #include "neverhood/resourceman.h"
+ #include "neverhood/scene.h"
++#include "neverhood/screen.h"
+ 
+ namespace Neverhood {
+ 
+@@ -268,6 +269,10 @@ void SmackerPlayer::updateFrame() {
+ 
+ 	_smackerSurface->frameNumber = _smackerDecoder->getCurFrame();
+ 
++	// Claybox HD: show the upscaled version of this frame if the user made one
++	if (smackerFrame && _vm->_screen->getHDLayer())
++		_vm->_screen->getHDLayer()->bindVideoFrame(smackerFrame, _fileHash, _smackerDecoder->getCurFrame());
++
+ 	if (_smackerFirst) {
+ 		_smackerSurface->setSmackerFrame(smackerFrame);
+ 		if (_drawX < 0 || _drawY < 0) {

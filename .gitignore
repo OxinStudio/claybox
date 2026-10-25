@@ -1,0 +1,19 @@
+# Build output
+scummvm/
+build-release/
+release/
+app/.build/
+app/build/
+app/vendor/
+
+# macOS
+.DS_Store
+*.dmg
+*.zip
+
+# Never commit game files or anything made from them
+DATA/
+*.blb
+*.BLB
+*.iso
+*.cdr

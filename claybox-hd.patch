@@ -1,5 +1,55 @@
+diff --git a/backends/events/sdl/sdl-common-events.cpp b/backends/events/sdl/sdl-common-events.cpp
+index 3aca0b1047..80625ca8e3 100644
+--- a/backends/events/sdl/sdl-common-events.cpp
++++ b/backends/events/sdl/sdl-common-events.cpp
+@@ -37,6 +37,13 @@ SdlEventSource::~SdlEventSource() {
+ 	closeJoystick();
+ }
+ 
++#if defined(MACOSX)
++// Claybox: in macOS full screen on MacBooks with a camera notch, SDL reports button
++// positions a few pixels off from the motion positions, so clicks land above the
++// cursor. Use the position of the last motion event for button presses instead.
++static bool s_clayboxHaveMotion = false;
++#endif
++
+ bool SdlEventSource::processMouseEvent(Common::Event &event, int x, int y, int relx, int rely) {
+ 	_mouseX = x;
+ 	_mouseY = y;
+@@ -134,6 +141,9 @@ bool SdlEventSource::handleMouseMotion(SDL_Event &ev, Common::Event &event) {
+ 	}
+ #endif
+ 
++#if defined(MACOSX)
++	s_clayboxHaveMotion = true;
++#endif
+ 	return processMouseEvent(event, ev.motion.x, ev.motion.y, ev.motion.xrel, ev.motion.yrel);
+ }
+ 
+@@ -163,6 +173,10 @@ bool SdlEventSource::handleMouseButtonDown(SDL_Event &ev, Common::Event &event)
+ 	else
+ 		return false;
+ 
++#if defined(MACOSX)
++	if (s_clayboxHaveMotion)
++		return processMouseEvent(event, _mouseX, _mouseY);
++#endif
+ 	return processMouseEvent(event, ev.button.x, ev.button.y);
+ }
+ 
+@@ -186,6 +200,10 @@ bool SdlEventSource::handleMouseButtonUp(SDL_Event &ev, Common::Event &event) {
+ 	else
+ 		return false;
+ 
++#if defined(MACOSX)
++	if (s_clayboxHaveMotion)
++		return processMouseEvent(event, _mouseX, _mouseY);
++#endif
+ 	return processMouseEvent(event, ev.button.x, ev.button.y);
+ }
+ 
 diff --git a/engines/neverhood/detection.cpp b/engines/neverhood/detection.cpp
-index dd5fa9d4..e4910609 100644
+index dd5fa9d48f..e491060934 100644
 --- a/engines/neverhood/detection.cpp
 +++ b/engines/neverhood/detection.cpp
 @@ -141,9 +141,17 @@ static const ADGameDescription gameDescriptions[] = {
@@ -21,7 +71,7 @@ index dd5fa9d4..e4910609 100644
  				    GAMEOPTION_SCALE_MAKING_OF_VIDEOS, GAMEOPTION_REPEAT_WILLIE_HINT);
  	}
 diff --git a/engines/neverhood/graphics.cpp b/engines/neverhood/graphics.cpp
-index cdf91b8d..31d14246 100644
+index cdf91b8ddd..31d1424661 100644
 --- a/engines/neverhood/graphics.cpp
 +++ b/engines/neverhood/graphics.cpp
 @@ -46,10 +46,22 @@ BaseSurface::BaseSurface(NeverhoodEngine *vm, int priority, int16 width, int16 h
@@ -101,7 +151,7 @@ index cdf91b8d..31d14246 100644
  	byte *dest = (byte*)_surface->getBasePtr(x, y);
  	int height = sourceRect.height;
 diff --git a/engines/neverhood/graphics.h b/engines/neverhood/graphics.h
-index 759ae929..f4dcc2ce 100644
+index 759ae92905..f4dcc2cea1 100644
 --- a/engines/neverhood/graphics.h
 +++ b/engines/neverhood/graphics.h
 @@ -120,6 +120,8 @@ protected:
@@ -113,450 +163,8 @@ index 759ae929..f4dcc2ce 100644
  };
  
  class ShadowSurface : public BaseSurface {
-diff --git a/engines/neverhood/hdlayer.cpp b/engines/neverhood/hdlayer.cpp
-new file mode 100644
-index 00000000..634d70a5
---- /dev/null
-+++ b/engines/neverhood/hdlayer.cpp
-@@ -0,0 +1,318 @@
-+/* ScummVM - Graphic Adventure Engine
-+ *
-+ * ScummVM is the legal property of its developers, whose names
-+ * are too numerous to list here. Please refer to the COPYRIGHT
-+ * file distributed with this source distribution.
-+ *
-+ * This program is free software: you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation, either version 3 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-+ *
-+ */
-+
-+#include "common/file.h"
-+#include "common/system.h"
-+#include "common/str.h"
-+#include "common/textconsole.h"
-+#include "image/png.h"
-+#include "image/jpeg.h"
-+
-+#include "neverhood/hdlayer.h"
-+#include "neverhood/neverhood.h"
-+#include "neverhood/resource.h"
-+
-+namespace Neverhood {
-+
-+HDLayer::HDLayer(NeverhoodEngine *vm, const Common::FSNode &dir, const Graphics::PixelFormat &format)
-+	: _vm(vm), _dir(dir), _format(format), _useCounter(0) {
-+	for (int i = 0; i < kAllSlots; i++)
-+		_images[i] = nullptr;
-+	_spriteDirChecked = _spriteDirOk = false;
-+	for (int i = 0; i < kVideoSlots; i++)
-+		_videoSlotHash[i] = 0;
-+}
-+
-+HDLayer::~HDLayer() {
-+	for (int i = 0; i < kAllSlots; i++)
-+		freeImage(i);
-+}
-+
-+bool HDLayer::folderHasImages(const Common::FSNode &dir) {
-+	if (!dir.exists() || !dir.isDirectory())
-+		return false;
-+	Common::FSList files;
-+	if (!dir.getChildren(files, Common::FSNode::kListFilesOnly))
-+		return false;
-+	for (Common::FSList::const_iterator it = files.begin(); it != files.end(); ++it)
-+		if (it->getFileName().hasSuffixIgnoreCase(".png"))
-+			return true;
-+	return false;
-+}
-+
-+void HDLayer::freeImage(int index) {
-+	if (_images[index]) {
-+		_images[index]->surface.free();
-+		delete _images[index];
-+		_images[index] = nullptr;
-+	}
-+}
-+
-+HDImage *HDLayer::loadImage(uint32 fileHash, const Graphics::Surface *surface) {
-+	const Common::String name = Common::String::format("%08X.png", fileHash);
-+	Common::FSNode node = _dir.getChild(name);
-+	if (!node.exists())
-+		return nullptr;
-+
-+	Common::File file;
-+	if (!file.open(node))
-+		return nullptr;
-+
-+	Image::PNGDecoder decoder;
-+	if (!decoder.loadStream(file)) {
-+		warning("Claybox HD: could not decode %s", name.c_str());
-+		return nullptr;
-+	}
-+
-+	const Graphics::Surface *png = decoder.getSurface();
-+	// The HD image is kScale x the original sprite. The background surface may be
-+	// a few pixels wider than the sprite (its pitch is aligned to 4 bytes).
-+	if (png->w > surface->w * kScale || png->h > surface->h * kScale ||
-+		png->w < (surface->w - 4) * kScale || png->h < surface->h * kScale) {
-+		warning("Claybox HD: %s has size %dx%d, expected about %dx%d - ignored",
-+			name.c_str(), png->w, png->h, surface->w * kScale, surface->h * kScale);
-+		return nullptr;
-+	}
-+
-+	HDImage *image = new HDImage();
-+	image->fileHash = fileHash;
-+	image->boundCount = 0;
-+	image->lastUse = 0;
-+	image->video = false;
-+	image->sprite = false;
-+	image->frame = 0;
-+	image->flipX = image->flipY = false;
-+	Graphics::Surface *converted = png->convertTo(_format, decoder.getPalette().data(), decoder.getPalette().size());
-+	image->surface.copyFrom(*converted);
-+	converted->free();
-+	delete converted;
-+
-+	// The palette the original bitmap was drawn with, used to follow palette fades.
-+	PaletteResource paletteResource(_vm);
-+	if (paletteResource.load(fileHash))
-+		paletteResource.copyPalette(image->basePalette);
-+	else
-+		memset(image->basePalette, 0, sizeof(image->basePalette));
-+
-+	g_system->logMessage(LogMessageType::kInfo, Common::String::format("Claybox HD: showing HD background %s\n", name.c_str()).c_str());
-+	return image;
-+}
-+
-+byte HDLayer::acquireImage(uint32 fileHash, const Graphics::Surface *surface) {
-+	// Already cached?
-+	for (int i = 0; i < kMaxImages; i++)
-+		if (_images[i] && _images[i]->fileHash == fileHash)
-+			return i + 1;
-+
-+	HDImage *image = loadImage(fileHash, surface);
-+	if (!image)
-+		return 0;
-+
-+	// Find a free slot, or evict the least recently used unbound image.
-+	int slot = -1;
-+	for (int i = 0; i < kMaxImages && slot < 0; i++)
-+		if (!_images[i])
-+			slot = i;
-+	if (slot < 0) {
-+		uint32 oldest = 0xFFFFFFFF;
-+		for (int i = 0; i < kMaxImages; i++)
-+			if (_images[i]->boundCount == 0 && _images[i]->lastUse < oldest) {
-+				oldest = _images[i]->lastUse;
-+				slot = i;
-+			}
-+	}
-+	if (slot < 0) {
-+		image->surface.free();
-+		delete image;
-+		return 0;
-+	}
-+	freeImage(slot);
-+	_images[slot] = image;
-+	return slot + 1;
-+}
-+
-+void HDLayer::bindSurface(const Graphics::Surface *surface, uint32 fileHash) {
-+	unbindSurface(surface);
-+	if (!fileHash)
-+		return;
-+	byte id = acquireImage(fileHash, surface);
-+	if (!id)
-+		return;
-+	HDImage *image = _images[id - 1];
-+	image->boundCount++;
-+	image->lastUse = ++_useCounter;
-+	Binding binding;
-+	binding.surface = surface;
-+	binding.imageId = id;
-+	_bindings.push_back(binding);
-+}
-+
-+void HDLayer::unbindSurface(const Graphics::Surface *surface) {
-+	for (uint i = 0; i < _bindings.size(); i++) {
-+		if (_bindings[i].surface == surface) {
-+			HDImage *image = getImage(_bindings[i].imageId);
-+			if (image && image->boundCount > 0)
-+				image->boundCount--;
-+			_bindings.remove_at(i);
-+			return;
-+		}
-+	}
-+}
-+
-+void HDLayer::bindVideoFrame(const Graphics::Surface *surface, uint32 fileHash, uint32 frame) {
-+	unbindSurface(surface);
-+	if (!_videoDir.exists())
-+		return;
-+	Common::FSNode dir = _videoDir.getChild(Common::String::format("%08X", fileHash));
-+	if (!dir.isDirectory())
-+		return;
-+	Common::FSNode node = dir.getChild(Common::String::format("%05u.jpg", frame));
-+	Common::File file;
-+	if (!node.exists() || !file.open(node))
-+		return;
-+	Image::JPEGDecoder decoder;
-+	if (!decoder.loadStream(file))
-+		return;
-+	const Graphics::Surface *jpg = decoder.getSurface();
-+	if (!jpg || jpg->w < surface->w * 2 - 8 || jpg->w > surface->w * 2 + 8 || jpg->h != surface->h * 2)
-+		return;
-+
-+	// reuse the slot already showing this video, else the other one
-+	int slot = 0;
-+	for (int i = 0; i < kVideoSlots; i++)
-+		if (_videoSlotHash[i] == fileHash)
-+			slot = i;
-+	if (_videoSlotHash[slot] != fileHash)
-+		for (int i = 0; i < kVideoSlots; i++)
-+			if (_videoSlotHash[i] == 0 || !_images[kMaxImages + i] || _images[kMaxImages + i]->boundCount == 0) {
-+				slot = i;
-+				break;
-+			}
-+	const int index = kMaxImages + slot;
-+	HDImage *image = _images[index];
-+	if (!image) {
-+		image = new HDImage();
-+		_images[index] = image;
-+	}
-+	image->surface.free();
-+	Graphics::Surface *converted = jpg->convertTo(_format);
-+	image->surface.copyFrom(*converted);
-+	converted->free();
-+	delete converted;
-+	image->fileHash = fileHash;
-+	image->video = true;
-+	image->sprite = false;
-+	image->boundCount = 1;
-+	image->lastUse = ++_useCounter;
-+	memset(image->basePalette, 0, sizeof(image->basePalette));
-+	_videoSlotHash[slot] = fileHash;
-+
-+	Binding binding;
-+	binding.surface = surface;
-+	binding.imageId = index + 1;
-+	_bindings.push_back(binding);
-+}
-+
-+void HDLayer::bindSprite(const Graphics::Surface *surface, uint32 animHash, uint32 frame, bool flipX, bool flipY) {
-+	unbindSurface(surface);
-+	if (!_spriteDirChecked) {
-+		_spriteDirChecked = true;
-+		_spriteDirOk = _spriteDir.exists() && _spriteDir.isDirectory();
-+	}
-+	if (!_spriteDirOk || !animHash)
-+		return;
-+
-+	// cached?
-+	int slot = -1;
-+	for (int i = kMaxImages + kVideoSlots; i < kAllSlots && slot < 0; i++) {
-+		const HDImage *im = _images[i];
-+		if (im && im->sprite && im->fileHash == animHash && im->frame == frame && im->flipX == flipX && im->flipY == flipY)
-+			slot = i;
-+	}
-+
-+	if (slot < 0) {
-+		Common::FSNode dir = _spriteDir.getChild(Common::String::format("%08X", animHash));
-+		Common::FSNode node = dir.getChild(Common::String::format("%04u.png", frame));
-+		Common::File file;
-+		if (!node.exists() || !file.open(node))
-+			return;
-+		Image::PNGDecoder decoder;
-+		if (!decoder.loadStream(file))
-+			return;
-+		Graphics::Surface *conv = decoder.getSurface()->convertTo(spriteFormat(), decoder.getPalette().data(), decoder.getPalette().size());
-+		if (!conv)
-+			return;
-+		// pick a free slot, else the least recently used unbound one
-+		uint32 oldest = 0xFFFFFFFF;
-+		for (int i = kMaxImages + kVideoSlots; i < kAllSlots; i++) {
-+			if (!_images[i]) { slot = i; break; }
-+			if (_images[i]->boundCount == 0 && _images[i]->lastUse < oldest) {
-+				oldest = _images[i]->lastUse;
-+				slot = i;
-+			}
-+		}
-+		if (slot < 0) {
-+			conv->free();
-+			delete conv;
-+			return;
-+		}
-+		freeImage(slot);
-+		HDImage *image = new HDImage();
-+		image->surface.create(conv->w, conv->h, spriteFormat());
-+		for (int y = 0; y < conv->h; y++)
-+			for (int x = 0; x < conv->w; x++) {
-+				const int sx = flipX ? conv->w - 1 - x : x;
-+				const int sy = flipY ? conv->h - 1 - y : y;
-+				*(uint32*)image->surface.getBasePtr(x, y) = *(const uint32*)conv->getBasePtr(sx, sy);
-+			}
-+		conv->free();
-+		delete conv;
-+		image->fileHash = animHash;
-+		image->frame = frame;
-+		image->flipX = flipX;
-+		image->flipY = flipY;
-+		image->video = false;
-+		image->sprite = true;
-+		image->boundCount = 0;
-+		memset(image->basePalette, 0, sizeof(image->basePalette));
-+		Common::File palFile;
-+		if (palFile.open(dir.getChild("palette.bin")))
-+			palFile.read(image->basePalette, 1024);
-+		_images[slot] = image;
-+	}
-+
-+	HDImage *image = _images[slot];
-+	image->boundCount++;
-+	image->lastUse = ++_useCounter;
-+	Binding binding;
-+	binding.surface = surface;
-+	binding.imageId = slot + 1;
-+	_bindings.push_back(binding);
-+}
-+
-+byte HDLayer::findImageId(const Graphics::Surface *surface) const {
-+	for (uint i = 0; i < _bindings.size(); i++)
-+		if (_bindings[i].surface == surface)
-+			return _bindings[i].imageId;
-+	return 0;
-+}
-+
-+} // End of namespace Neverhood
-diff --git a/engines/neverhood/hdlayer.h b/engines/neverhood/hdlayer.h
-new file mode 100644
-index 00000000..47a168dc
---- /dev/null
-+++ b/engines/neverhood/hdlayer.h
-@@ -0,0 +1,112 @@
-+/* ScummVM - Graphic Adventure Engine
-+ *
-+ * ScummVM is the legal property of its developers, whose names
-+ * are too numerous to list here. Please refer to the COPYRIGHT
-+ * file distributed with this source distribution.
-+ *
-+ * This program is free software: you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation, either version 3 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-+ *
-+ */
-+
-+// Claybox HD layer: optional 2x replacement images for backgrounds.
-+//
-+// The game logic keeps running at 640x480 with 8-bit indexed pixels.
-+// HD images are looked up by resource hash in a user-generated folder
-+// (made on the user's own machine from their own game disc; nothing is
-+// shipped with the app). Everything without an HD image is scaled up
-+// from the original pixels.
-+
-+#ifndef NEVERHOOD_HDLAYER_H
-+#define NEVERHOOD_HDLAYER_H
-+
-+#include "common/array.h"
-+#include "common/fs.h"
-+#include "graphics/pixelformat.h"
-+#include "graphics/surface.h"
-+
-+namespace Neverhood {
-+
-+class NeverhoodEngine;
-+
-+struct HDImage {
-+	uint32 fileHash;
-+	Graphics::Surface surface;  // kScale x the original, in the screen format
-+	byte basePalette[1024];     // the palette the image was made with (RGBX)
-+	uint32 lastUse;
-+	int boundCount;
-+	bool video;              // a video frame: colors are final, no palette following
-+	bool sprite;             // an animation frame: RGBA (alpha = soft edges), stored as RGBA32
-+	uint32 frame;            // sprite frame index
-+	bool flipX, flipY;       // sprite stored mirrored
-+};
-+
-+class HDLayer {
-+public:
-+	static const int kScale = 2;
-+	static const int kMaxImages = 16;      // background slots: ids 1..16
-+	static const int kVideoSlots = 2;      // video frame slots: ids 17..18
-+	static const int kSpriteSlots = 100;   // animation frame slots: ids 19..118
-+	static const int kAllSlots = kMaxImages + kVideoSlots + kSpriteSlots;
-+	static const byte kDoubledFlag = 0x80; // owner flag: pixel belongs to a 2x-doubled video
-+
-+	HDLayer(NeverhoodEngine *vm, const Common::FSNode &dir, const Graphics::PixelFormat &format);
-+	~HDLayer();
-+
-+	// Called whenever a background surface gets new pixels.
-+	void bindSurface(const Graphics::Surface *surface, uint32 fileHash);
-+	void unbindSurface(const Graphics::Surface *surface);
-+
-+	// Returns an image id (1..kMaxImages) bound to the surface, or 0.
-+	byte findImageId(const Graphics::Surface *surface) const;
-+	HDImage *getImage(byte id) const { return (id > 0 && id <= kAllSlots) ? _images[id - 1] : nullptr; }
-+
-+	// HD animation frames: <sprite folder>/<ANIM>/<FFFF>.png (RGBA, 2x) + palette.bin
-+	void setSpriteDir(const Common::FSNode &dir) { _spriteDir = dir; }
-+	void bindSprite(const Graphics::Surface *surface, uint32 animHash, uint32 frame, bool flipX, bool flipY);
-+	static Graphics::PixelFormat spriteFormat() { return Graphics::PixelFormat::createFormatRGBA32(); }
-+
-+	// HD video frames: <video folder>/<HASH>/<NNNNN>.jpg, 2x the video's own size.
-+	void setVideoDir(const Common::FSNode &dir) { _videoDir = dir; }
-+	void bindVideoFrame(const Graphics::Surface *surface, uint32 fileHash, uint32 frame);
-+
-+	const Graphics::PixelFormat &getFormat() const { return _format; }
-+
-+	// True if the folder contains at least one HD image.
-+	static bool folderHasImages(const Common::FSNode &dir);
-+
-+private:
-+	struct Binding {
-+		const Graphics::Surface *surface;
-+		byte imageId;
-+	};
-+
-+	byte acquireImage(uint32 fileHash, const Graphics::Surface *surface);
-+	HDImage *loadImage(uint32 fileHash, const Graphics::Surface *surface);
-+	void freeImage(int index);
-+
-+	NeverhoodEngine *_vm;
-+	Common::FSNode _dir;
-+	Graphics::PixelFormat _format;
-+	HDImage *_images[kAllSlots];
-+	Common::FSNode _spriteDir;
-+	bool _spriteDirChecked, _spriteDirOk;
-+	Common::FSNode _videoDir;
-+	uint32 _videoSlotHash[kVideoSlots];
-+	Common::Array<Binding> _bindings;
-+	uint32 _useCounter;
-+};
-+
-+} // End of namespace Neverhood
-+
-+#endif /* NEVERHOOD_HDLAYER_H */
 diff --git a/engines/neverhood/module.mk b/engines/neverhood/module.mk
-index 6f27485e..1c64b8ef 100644
+index 6f27485eaa..1c64b8efbb 100644
 --- a/engines/neverhood/module.mk
 +++ b/engines/neverhood/module.mk
 @@ -10,6 +10,7 @@ MODULE_OBJS = \
@@ -568,7 +176,7 @@ index 6f27485e..1c64b8ef 100644
  	menumodule.o \
  	metaengine.o \
 diff --git a/engines/neverhood/mouse.cpp b/engines/neverhood/mouse.cpp
-index 1d867839..8a173d18 100644
+index 1d8678398a..8a173d1885 100644
 --- a/engines/neverhood/mouse.cpp
 +++ b/engines/neverhood/mouse.cpp
 @@ -20,6 +20,7 @@
@@ -636,7 +244,7 @@ index 1d867839..8a173d18 100644
  
  }
 diff --git a/engines/neverhood/neverhood.cpp b/engines/neverhood/neverhood.cpp
-index 787e50e3..c88293bb 100644
+index 787e50e354..c88293bba7 100644
 --- a/engines/neverhood/neverhood.cpp
 +++ b/engines/neverhood/neverhood.cpp
 @@ -32,12 +32,16 @@
@@ -904,7 +512,7 @@ index 787e50e3..c88293bb 100644
  			case Common::EVENT_CUSTOM_ENGINE_ACTION_START:
  				_gameModule->handleKeyDown(event.customType);
 diff --git a/engines/neverhood/neverhood.h b/engines/neverhood/neverhood.h
-index db3b9e67..c3650b29 100644
+index db3b9e67ab..c3650b2998 100644
 --- a/engines/neverhood/neverhood.h
 +++ b/engines/neverhood/neverhood.h
 @@ -24,6 +24,7 @@
@@ -927,7 +535,7 @@ index db3b9e67..c3650b29 100644
  	GameVars *_gameVars;
  	Screen *_screen;
 diff --git a/engines/neverhood/resource.h b/engines/neverhood/resource.h
-index ad471dee..9ff68742 100644
+index ad471deedb..9ff687426c 100644
 --- a/engines/neverhood/resource.h
 +++ b/engines/neverhood/resource.h
 @@ -59,6 +59,7 @@ public:
@@ -950,7 +558,7 @@ index ad471dee..9ff68742 100644
  	NeverhoodEngine *_vm;
  	ResourceHandle _resourceHandle;
 diff --git a/engines/neverhood/resourceman.cpp b/engines/neverhood/resourceman.cpp
-index 726c1700..ae880efc 100644
+index 726c1700d6..ae880efc35 100644
 --- a/engines/neverhood/resourceman.cpp
 +++ b/engines/neverhood/resourceman.cpp
 @@ -19,10 +19,21 @@
@@ -976,7 +584,7 @@ index 726c1700..ae880efc 100644
  	: _resourceFileEntry(nullptr), _data(nullptr) {
  }
 diff --git a/engines/neverhood/resourceman.h b/engines/neverhood/resourceman.h
-index 2decc596..8f84d2c8 100644
+index 2decc59663..8f84d2c8cd 100644
 --- a/engines/neverhood/resourceman.h
 +++ b/engines/neverhood/resourceman.h
 @@ -122,6 +122,8 @@ public:
@@ -989,7 +597,7 @@ index 2decc596..8f84d2c8 100644
  	typedef Common::HashMap<uint32, ResourceFileEntry> EntriesMap;
  	Common::Array<BlbArchive*> _archives;
 diff --git a/engines/neverhood/screen.cpp b/engines/neverhood/screen.cpp
-index 11e8c632..fefde6f5 100644
+index 11e8c6324d..fefde6f5b9 100644
 --- a/engines/neverhood/screen.cpp
 +++ b/engines/neverhood/screen.cpp
 @@ -21,6 +21,7 @@
@@ -1515,7 +1123,7 @@ index 11e8c632..fefde6f5 100644
 +
  } // End of namespace Neverhood
 diff --git a/engines/neverhood/screen.h b/engines/neverhood/screen.h
-index 7bd2f3b4..6ae4ffff 100644
+index 7bd2f3b4fc..6ae4ffff29 100644
 --- a/engines/neverhood/screen.h
 +++ b/engines/neverhood/screen.h
 @@ -27,6 +27,7 @@
@@ -1557,7 +1165,7 @@ index 7bd2f3b4..6ae4ffff 100644
  	MicroTileArray *_microTiles;
  	Graphics::Surface *_backScreen;
 diff --git a/engines/neverhood/smackerplayer.cpp b/engines/neverhood/smackerplayer.cpp
-index 79812aa9..90f6e8d2 100644
+index 79812aa97a..90f6e8d287 100644
 --- a/engines/neverhood/smackerplayer.cpp
 +++ b/engines/neverhood/smackerplayer.cpp
 @@ -24,6 +24,7 @@
@@ -1579,3 +1187,445 @@ index 79812aa9..90f6e8d2 100644
  	if (_smackerFirst) {
  		_smackerSurface->setSmackerFrame(smackerFrame);
  		if (_drawX < 0 || _drawY < 0) {
+diff --git a/engines/neverhood/hdlayer.cpp b/engines/neverhood/hdlayer.cpp
+new file mode 100644
+index 0000000000..634d70a502
+--- /dev/null
++++ b/engines/neverhood/hdlayer.cpp
+@@ -0,0 +1,318 @@
++/* ScummVM - Graphic Adventure Engine
++ *
++ * ScummVM is the legal property of its developers, whose names
++ * are too numerous to list here. Please refer to the COPYRIGHT
++ * file distributed with this source distribution.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include "common/file.h"
++#include "common/system.h"
++#include "common/str.h"
++#include "common/textconsole.h"
++#include "image/png.h"
++#include "image/jpeg.h"
++
++#include "neverhood/hdlayer.h"
++#include "neverhood/neverhood.h"
++#include "neverhood/resource.h"
++
++namespace Neverhood {
++
++HDLayer::HDLayer(NeverhoodEngine *vm, const Common::FSNode &dir, const Graphics::PixelFormat &format)
++	: _vm(vm), _dir(dir), _format(format), _useCounter(0) {
++	for (int i = 0; i < kAllSlots; i++)
++		_images[i] = nullptr;
++	_spriteDirChecked = _spriteDirOk = false;
++	for (int i = 0; i < kVideoSlots; i++)
++		_videoSlotHash[i] = 0;
++}
++
++HDLayer::~HDLayer() {
++	for (int i = 0; i < kAllSlots; i++)
++		freeImage(i);
++}
++
++bool HDLayer::folderHasImages(const Common::FSNode &dir) {
++	if (!dir.exists() || !dir.isDirectory())
++		return false;
++	Common::FSList files;
++	if (!dir.getChildren(files, Common::FSNode::kListFilesOnly))
++		return false;
++	for (Common::FSList::const_iterator it = files.begin(); it != files.end(); ++it)
++		if (it->getFileName().hasSuffixIgnoreCase(".png"))
++			return true;
++	return false;
++}
++
++void HDLayer::freeImage(int index) {
++	if (_images[index]) {
++		_images[index]->surface.free();
++		delete _images[index];
++		_images[index] = nullptr;
++	}
++}
++
++HDImage *HDLayer::loadImage(uint32 fileHash, const Graphics::Surface *surface) {
++	const Common::String name = Common::String::format("%08X.png", fileHash);
++	Common::FSNode node = _dir.getChild(name);
++	if (!node.exists())
++		return nullptr;
++
++	Common::File file;
++	if (!file.open(node))
++		return nullptr;
++
++	Image::PNGDecoder decoder;
++	if (!decoder.loadStream(file)) {
++		warning("Claybox HD: could not decode %s", name.c_str());
++		return nullptr;
++	}
++
++	const Graphics::Surface *png = decoder.getSurface();
++	// The HD image is kScale x the original sprite. The background surface may be
++	// a few pixels wider than the sprite (its pitch is aligned to 4 bytes).
++	if (png->w > surface->w * kScale || png->h > surface->h * kScale ||
++		png->w < (surface->w - 4) * kScale || png->h < surface->h * kScale) {
++		warning("Claybox HD: %s has size %dx%d, expected about %dx%d - ignored",
++			name.c_str(), png->w, png->h, surface->w * kScale, surface->h * kScale);
++		return nullptr;
++	}
++
++	HDImage *image = new HDImage();
++	image->fileHash = fileHash;
++	image->boundCount = 0;
++	image->lastUse = 0;
++	image->video = false;
++	image->sprite = false;
++	image->frame = 0;
++	image->flipX = image->flipY = false;
++	Graphics::Surface *converted = png->convertTo(_format, decoder.getPalette().data(), decoder.getPalette().size());
++	image->surface.copyFrom(*converted);
++	converted->free();
++	delete converted;
++
++	// The palette the original bitmap was drawn with, used to follow palette fades.
++	PaletteResource paletteResource(_vm);
++	if (paletteResource.load(fileHash))
++		paletteResource.copyPalette(image->basePalette);
++	else
++		memset(image->basePalette, 0, sizeof(image->basePalette));
++
++	g_system->logMessage(LogMessageType::kInfo, Common::String::format("Claybox HD: showing HD background %s\n", name.c_str()).c_str());
++	return image;
++}
++
++byte HDLayer::acquireImage(uint32 fileHash, const Graphics::Surface *surface) {
++	// Already cached?
++	for (int i = 0; i < kMaxImages; i++)
++		if (_images[i] && _images[i]->fileHash == fileHash)
++			return i + 1;
++
++	HDImage *image = loadImage(fileHash, surface);
++	if (!image)
++		return 0;
++
++	// Find a free slot, or evict the least recently used unbound image.
++	int slot = -1;
++	for (int i = 0; i < kMaxImages && slot < 0; i++)
++		if (!_images[i])
++			slot = i;
++	if (slot < 0) {
++		uint32 oldest = 0xFFFFFFFF;
++		for (int i = 0; i < kMaxImages; i++)
++			if (_images[i]->boundCount == 0 && _images[i]->lastUse < oldest) {
++				oldest = _images[i]->lastUse;
++				slot = i;
++			}
++	}
++	if (slot < 0) {
++		image->surface.free();
++		delete image;
++		return 0;
++	}
++	freeImage(slot);
++	_images[slot] = image;
++	return slot + 1;
++}
++
++void HDLayer::bindSurface(const Graphics::Surface *surface, uint32 fileHash) {
++	unbindSurface(surface);
++	if (!fileHash)
++		return;
++	byte id = acquireImage(fileHash, surface);
++	if (!id)
++		return;
++	HDImage *image = _images[id - 1];
++	image->boundCount++;
++	image->lastUse = ++_useCounter;
++	Binding binding;
++	binding.surface = surface;
++	binding.imageId = id;
++	_bindings.push_back(binding);
++}
++
++void HDLayer::unbindSurface(const Graphics::Surface *surface) {
++	for (uint i = 0; i < _bindings.size(); i++) {
++		if (_bindings[i].surface == surface) {
++			HDImage *image = getImage(_bindings[i].imageId);
++			if (image && image->boundCount > 0)
++				image->boundCount--;
++			_bindings.remove_at(i);
++			return;
++		}
++	}
++}
++
++void HDLayer::bindVideoFrame(const Graphics::Surface *surface, uint32 fileHash, uint32 frame) {
++	unbindSurface(surface);
++	if (!_videoDir.exists())
++		return;
++	Common::FSNode dir = _videoDir.getChild(Common::String::format("%08X", fileHash));
++	if (!dir.isDirectory())
++		return;
++	Common::FSNode node = dir.getChild(Common::String::format("%05u.jpg", frame));
++	Common::File file;
++	if (!node.exists() || !file.open(node))
++		return;
++	Image::JPEGDecoder decoder;
++	if (!decoder.loadStream(file))
++		return;
++	const Graphics::Surface *jpg = decoder.getSurface();
++	if (!jpg || jpg->w < surface->w * 2 - 8 || jpg->w > surface->w * 2 + 8 || jpg->h != surface->h * 2)
++		return;
++
++	// reuse the slot already showing this video, else the other one
++	int slot = 0;
++	for (int i = 0; i < kVideoSlots; i++)
++		if (_videoSlotHash[i] == fileHash)
++			slot = i;
++	if (_videoSlotHash[slot] != fileHash)
++		for (int i = 0; i < kVideoSlots; i++)
++			if (_videoSlotHash[i] == 0 || !_images[kMaxImages + i] || _images[kMaxImages + i]->boundCount == 0) {
++				slot = i;
++				break;
++			}
++	const int index = kMaxImages + slot;
++	HDImage *image = _images[index];
++	if (!image) {
++		image = new HDImage();
++		_images[index] = image;
++	}
++	image->surface.free();
++	Graphics::Surface *converted = jpg->convertTo(_format);
++	image->surface.copyFrom(*converted);
++	converted->free();
++	delete converted;
++	image->fileHash = fileHash;
++	image->video = true;
++	image->sprite = false;
++	image->boundCount = 1;
++	image->lastUse = ++_useCounter;
++	memset(image->basePalette, 0, sizeof(image->basePalette));
++	_videoSlotHash[slot] = fileHash;
++
++	Binding binding;
++	binding.surface = surface;
++	binding.imageId = index + 1;
++	_bindings.push_back(binding);
++}
++
++void HDLayer::bindSprite(const Graphics::Surface *surface, uint32 animHash, uint32 frame, bool flipX, bool flipY) {
++	unbindSurface(surface);
++	if (!_spriteDirChecked) {
++		_spriteDirChecked = true;
++		_spriteDirOk = _spriteDir.exists() && _spriteDir.isDirectory();
++	}
++	if (!_spriteDirOk || !animHash)
++		return;
++
++	// cached?
++	int slot = -1;
++	for (int i = kMaxImages + kVideoSlots; i < kAllSlots && slot < 0; i++) {
++		const HDImage *im = _images[i];
++		if (im && im->sprite && im->fileHash == animHash && im->frame == frame && im->flipX == flipX && im->flipY == flipY)
++			slot = i;
++	}
++
++	if (slot < 0) {
++		Common::FSNode dir = _spriteDir.getChild(Common::String::format("%08X", animHash));
++		Common::FSNode node = dir.getChild(Common::String::format("%04u.png", frame));
++		Common::File file;
++		if (!node.exists() || !file.open(node))
++			return;
++		Image::PNGDecoder decoder;
++		if (!decoder.loadStream(file))
++			return;
++		Graphics::Surface *conv = decoder.getSurface()->convertTo(spriteFormat(), decoder.getPalette().data(), decoder.getPalette().size());
++		if (!conv)
++			return;
++		// pick a free slot, else the least recently used unbound one
++		uint32 oldest = 0xFFFFFFFF;
++		for (int i = kMaxImages + kVideoSlots; i < kAllSlots; i++) {
++			if (!_images[i]) { slot = i; break; }
++			if (_images[i]->boundCount == 0 && _images[i]->lastUse < oldest) {
++				oldest = _images[i]->lastUse;
++				slot = i;
++			}
++		}
++		if (slot < 0) {
++			conv->free();
++			delete conv;
++			return;
++		}
++		freeImage(slot);
++		HDImage *image = new HDImage();
++		image->surface.create(conv->w, conv->h, spriteFormat());
++		for (int y = 0; y < conv->h; y++)
++			for (int x = 0; x < conv->w; x++) {
++				const int sx = flipX ? conv->w - 1 - x : x;
++				const int sy = flipY ? conv->h - 1 - y : y;
++				*(uint32*)image->surface.getBasePtr(x, y) = *(const uint32*)conv->getBasePtr(sx, sy);
++			}
++		conv->free();
++		delete conv;
++		image->fileHash = animHash;
++		image->frame = frame;
++		image->flipX = flipX;
++		image->flipY = flipY;
++		image->video = false;
++		image->sprite = true;
++		image->boundCount = 0;
++		memset(image->basePalette, 0, sizeof(image->basePalette));
++		Common::File palFile;
++		if (palFile.open(dir.getChild("palette.bin")))
++			palFile.read(image->basePalette, 1024);
++		_images[slot] = image;
++	}
++
++	HDImage *image = _images[slot];
++	image->boundCount++;
++	image->lastUse = ++_useCounter;
++	Binding binding;
++	binding.surface = surface;
++	binding.imageId = slot + 1;
++	_bindings.push_back(binding);
++}
++
++byte HDLayer::findImageId(const Graphics::Surface *surface) const {
++	for (uint i = 0; i < _bindings.size(); i++)
++		if (_bindings[i].surface == surface)
++			return _bindings[i].imageId;
++	return 0;
++}
++
++} // End of namespace Neverhood
+diff --git a/engines/neverhood/hdlayer.h b/engines/neverhood/hdlayer.h
+new file mode 100644
+index 0000000000..47a168dc25
+--- /dev/null
++++ b/engines/neverhood/hdlayer.h
+@@ -0,0 +1,112 @@
++/* ScummVM - Graphic Adventure Engine
++ *
++ * ScummVM is the legal property of its developers, whose names
++ * are too numerous to list here. Please refer to the COPYRIGHT
++ * file distributed with this source distribution.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++// Claybox HD layer: optional 2x replacement images for backgrounds.
++//
++// The game logic keeps running at 640x480 with 8-bit indexed pixels.
++// HD images are looked up by resource hash in a user-generated folder
++// (made on the user's own machine from their own game disc; nothing is
++// shipped with the app). Everything without an HD image is scaled up
++// from the original pixels.
++
++#ifndef NEVERHOOD_HDLAYER_H
++#define NEVERHOOD_HDLAYER_H
++
++#include "common/array.h"
++#include "common/fs.h"
++#include "graphics/pixelformat.h"
++#include "graphics/surface.h"
++
++namespace Neverhood {
++
++class NeverhoodEngine;
++
++struct HDImage {
++	uint32 fileHash;
++	Graphics::Surface surface;  // kScale x the original, in the screen format
++	byte basePalette[1024];     // the palette the image was made with (RGBX)
++	uint32 lastUse;
++	int boundCount;
++	bool video;              // a video frame: colors are final, no palette following
++	bool sprite;             // an animation frame: RGBA (alpha = soft edges), stored as RGBA32
++	uint32 frame;            // sprite frame index
++	bool flipX, flipY;       // sprite stored mirrored
++};
++
++class HDLayer {
++public:
++	static const int kScale = 2;
++	static const int kMaxImages = 16;      // background slots: ids 1..16
++	static const int kVideoSlots = 2;      // video frame slots: ids 17..18
++	static const int kSpriteSlots = 100;   // animation frame slots: ids 19..118
++	static const int kAllSlots = kMaxImages + kVideoSlots + kSpriteSlots;
++	static const byte kDoubledFlag = 0x80; // owner flag: pixel belongs to a 2x-doubled video
++
++	HDLayer(NeverhoodEngine *vm, const Common::FSNode &dir, const Graphics::PixelFormat &format);
++	~HDLayer();
++
++	// Called whenever a background surface gets new pixels.
++	void bindSurface(const Graphics::Surface *surface, uint32 fileHash);
++	void unbindSurface(const Graphics::Surface *surface);
++
++	// Returns an image id (1..kMaxImages) bound to the surface, or 0.
++	byte findImageId(const Graphics::Surface *surface) const;
++	HDImage *getImage(byte id) const { return (id > 0 && id <= kAllSlots) ? _images[id - 1] : nullptr; }
++
++	// HD animation frames: <sprite folder>/<ANIM>/<FFFF>.png (RGBA, 2x) + palette.bin
++	void setSpriteDir(const Common::FSNode &dir) { _spriteDir = dir; }
++	void bindSprite(const Graphics::Surface *surface, uint32 animHash, uint32 frame, bool flipX, bool flipY);
++	static Graphics::PixelFormat spriteFormat() { return Graphics::PixelFormat::createFormatRGBA32(); }
++
++	// HD video frames: <video folder>/<HASH>/<NNNNN>.jpg, 2x the video's own size.
++	void setVideoDir(const Common::FSNode &dir) { _videoDir = dir; }
++	void bindVideoFrame(const Graphics::Surface *surface, uint32 fileHash, uint32 frame);
++
++	const Graphics::PixelFormat &getFormat() const { return _format; }
++
++	// True if the folder contains at least one HD image.
++	static bool folderHasImages(const Common::FSNode &dir);
++
++private:
++	struct Binding {
++		const Graphics::Surface *surface;
++		byte imageId;
++	};
++
++	byte acquireImage(uint32 fileHash, const Graphics::Surface *surface);
++	HDImage *loadImage(uint32 fileHash, const Graphics::Surface *surface);
++	void freeImage(int index);
++
++	NeverhoodEngine *_vm;
++	Common::FSNode _dir;
++	Graphics::PixelFormat _format;
++	HDImage *_images[kAllSlots];
++	Common::FSNode _spriteDir;
++	bool _spriteDirChecked, _spriteDirOk;
++	Common::FSNode _videoDir;
++	uint32 _videoSlotHash[kVideoSlots];
++	Common::Array<Binding> _bindings;
++	uint32 _useCounter;
++};
++
++} // End of namespace Neverhood
++
++#endif /* NEVERHOOD_HDLAYER_H */
